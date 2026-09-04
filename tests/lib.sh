@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared test helpers. Sourced by every *.test.sh file.
 set -uo pipefail
 

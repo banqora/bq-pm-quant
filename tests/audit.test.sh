@@ -8,7 +8,7 @@ echo "$TEST_NAME"
 
 tmp="$(make_tmpdir)"
 trap 'rm -rf "$tmp"' EXIT
-cd "$tmp"
+cd "$tmp" || exit 1
 
 cat > "$tmp/ids.py" <<'PY'
 import json
@@ -328,5 +328,5 @@ assert_eq "a disclaimer question still routes to conduct" \
 assert_eq "an attribution question still routes to attribution" \
   "attribution.md" "$(route "brinson allocation and selection effects")"
 
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 finish

@@ -264,6 +264,8 @@ PY
 )"
 echo "$out" | sed 's/^/  /'
 n_fail="$(echo "$out" | sed -n 's/^FAILCOUNT //p')"
+# shellcheck disable=SC2034  # both are read by finish() in lib.sh
 TESTS_RUN=$(echo "$out" | grep -cE '^(ok|FAIL) ')
+# shellcheck disable=SC2034  # read by finish() in lib.sh
 TESTS_FAILED="${n_fail:-1}"
 finish

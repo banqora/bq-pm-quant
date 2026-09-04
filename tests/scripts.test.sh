@@ -7,7 +7,7 @@ echo "$TEST_NAME"
 
 tmp="$(make_tmpdir)"
 trap 'rm -rf "$tmp"' EXIT
-cd "$tmp"
+cd "$tmp" || exit 1
 
 # ---------------------------------------------------------------- pm-stats
 gen_returns "$tmp/good.csv" 2520 1.0 0.12 42
@@ -460,5 +460,5 @@ for s in pm-stats pm-audit pm-docs pm-prefs; do
   assert_ok "$s --help exits zero" "$BIN/$s" --help
 done
 
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 finish

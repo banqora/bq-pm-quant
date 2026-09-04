@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Deterministic fixture generators. No third-party dependencies, no network.
 gen_returns() {  # gen_returns <out.csv> <n> <ann_sharpe> <ann_vol> <seed>
   python3 - "$@" <<'PY'

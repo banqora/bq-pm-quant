@@ -53,3 +53,15 @@ files = [
 [[tool.mypy.overrides]]
 module = ["scipy.*"]
 ignore_missing_imports = true
+
+[tool.codespell]
+skip = ".git,*.svg,LICENSE,.mypy_cache"
+# Domain vocabulary and deliberate fragments, each a codespell false positive:
+#   trough        the low point of a drawdown, not "through"
+#   te            tracking error, as a pm-docs routing keyword and a local variable
+#   grap          GRAP, the multi-period attribution linking method
+#   ttest         a pm-docs keyword covering the "ttest" spelling users type
+#   nd, ot        substrings inside a shell variable name and a regex alternation
+#   alternativ    a deliberate regex stem matching alternative/alternatives
+#   pre-emptively British form, which is this repository's voice throughout
+ignore-words-list = "trough,te,grap,ttest,nd,ot,alternativ,pre-emptively"

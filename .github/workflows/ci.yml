@@ -38,11 +38,13 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install pinned tools
-        run: pip install ruff==0.14.4 mypy==2.3.1
+        run: pip install ruff==0.14.4 mypy==2.3.1 codespell==2.4.1
       - name: Lint
         run: ruff check .
       - name: Type check
         run: mypy
+      - name: Spelling
+        run: codespell
 
   shellcheck:
     runs-on: ubuntu-latest
