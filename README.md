@@ -168,6 +168,17 @@ must not trigger it.
 Eight cases at one run each is a smoke test, not a measurement. A green run means no known
 regression. See [evals/README.md](evals/README.md).
 
+## Releases
+
+Every push to `main` that passes the full gate is tagged automatically with the next patch
+version. `scripts/next-version` prints what that tag will be: the newest `vX.Y.Z` incremented, or
+`v0.1.0` when none exists. It exits 3 without printing when `HEAD` already carries a tag, so a
+re-run does not double-tag.
+
+To open a new minor or major series, push a `vX.Y.0` tag by hand and the next automatic tag
+continues from it. A run whose commit is no longer the tip of `main` skips tagging, so versions
+cannot land out of order when two pushes overlap.
+
 ## Custom integrations
 
 The skill is deliberately self-contained: standard library only, offline, and it starts from a

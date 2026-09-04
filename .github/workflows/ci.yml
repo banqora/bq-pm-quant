@@ -2,9 +2,9 @@ name: ci
 
 on:
   push:
-    # This repo's default branch is master; [main] alone meant the push trigger never fired.
-    branches: [main, master]
+    branches: [main]
   pull_request:
+  workflow_dispatch:      # the manual lever for a missed push event
 
 permissions:
   contents: read
@@ -52,10 +52,74 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check shell syntax
         run: |
-          for f in tests/run tests/*.sh scripts/check-skill; do
+          for f in tests/run tests/*.sh scripts/check-skill scripts/next-version; do
             bash -n "$f"
           done
       - uses: ludeeus/action-shellcheck@master
         with:
           severity: warning
           ignore_paths: skills
+
+  ci-passed:
+    # Stable aggregate: one job the tag step can depend on, so adding a gate above does not
+    # silently stop gating the tag.
+    if: always()
+    needs: [test, quality, shellcheck]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm all gates passed
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          SHELLCHECK_RESULT: ${{ needs.shellcheck.result }}
+        run: |
+          for result in "$TEST_RESULT" "$QUALITY_RESULT" "$SHELLCHECK_RESULT"; do
+            [[ "$result" == success ]] || {
+              echo "A required gate did not succeed: $result" >&2
+              exit 1
+            }
+          done
+          echo "All gates passed."
+
+  tag:
+    # The latest main tip that passes the full gate gets an annotated version tag. An older run
+    # skips tagging once a newer commit has reached main, so versions cannot land out of order
+    # when CI durations differ. The patch number auto-increments from the newest vX.Y.Z tag; push
+    # a vX.Y.0 tag by hand to open a new minor or major series.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+    needs: [ci-passed]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: tag-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag with the next patch version
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin "+refs/heads/main:refs/remotes/origin/main"
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse refs/remotes/origin/main)" ]]; then
+            echo "A newer main tip exists; its run will allocate the next tag." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if next="$(scripts/next-version)"; then
+            :
+          else
+            status=$?
+            if [ "$status" -eq 3 ]; then
+              echo "HEAD already carries a release tag; skipping" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            exit "$status"
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$next" -m "bq-pm-quant $next"
+          git push origin "refs/tags/$next"
+          echo "Tagged $next" >> "$GITHUB_STEP_SUMMARY"
