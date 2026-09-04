@@ -1,0 +1,25 @@
+{
+  "name": "bq-pm-quant",
+  "description": "Agent skill for portfolio-manager quantitative analysis: performance and risk statistics reported with sample sizes and standard errors, out-of-sample and multiple-testing protocol, backtest construction, data-integrity checks, and analysis-code standards a non-coding manager can audit.",
+  "owner": {
+    "name": "Nicholas Holden",
+    "email": "nicholas.holden@banqora.com"
+  },
+  "plugins": [
+    {
+      "name": "bq-pm-quant",
+      "source": "./skills/bq-pm-quant",
+      "displayName": "PM Quant",
+      "description": "Portfolio-manager quantitative analysis: correct performance and risk statistics with standard errors, out-of-sample protocol, search correction, backtest construction, data hygiene, and the coding standards behind them.",
+      "author": {
+        "name": "Nicholas Holden",
+        "url": "https://github.com/banqora"
+      },
+      "homepage": "https://github.com/banqora/bq-pm-quant",
+      "repository": "https://github.com/banqora/bq-pm-quant",
+      "license": "Apache-2.0",
+      "keywords": ["portfolio-management", "quantitative-finance", "equity", "backtesting",
+                   "statistics", "risk", "agent-skill"]
+    }
+  ]
+}

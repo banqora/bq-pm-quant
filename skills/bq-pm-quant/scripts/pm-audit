@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Static audit of Python portfolio-analysis code for defects that produce plausible wrong numbers.
+
+Flags the defect classes that silently change a headline result: look-ahead, leakage, degrees of
+freedom, silent fallbacks, positional alignment, hardcoded conventions, and non-determinism.
+
+This is a lint, not a proof. It reports candidates for inspection; a finding is not a bug until you
+have looked at it, and a clean run is not evidence of correctness. Nothing here replaces the
+golden test and the noise test.
+
+Usage:
+  pm-audit <path> [<path> ...]        files or directories
+  pm-audit <path> --severity high     only high-severity findings
+  pm-audit <path> --json
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import re
+import sys
+from pathlib import Path
+
+HIGH, MED, LOW = "high", "medium", "low"
+
+# (id, severity, regex, message) — regex checks run per line.
+LINE_RULES = [
+    ("LOOKAHEAD-SHIFT-NEG", HIGH, r"\.shift\(\s*-\s*\d+",
+     "negative shift moves future data into the present; a forward return must be built by "
+     "shifting the return backwards relative to the signal, not the signal forwards"),
+    ("LOOKAHEAD-CENTER", HIGH, r"center\s*=\s*True",
+     "a centred rolling window uses future observations; use a trailing window"),
+    ("LOOKAHEAD-BFILL", HIGH, r"\.(bfill|backfill)\(|method\s*=\s*['\"](bfill|backfill)['\"]",
+     "backward fill propagates future values into the past"),
+    ("LEAK-SHUFFLE", HIGH, r"shuffle\s*=\s*True",
+     "shuffling a time series destroys the temporal ordering and leaks the future into training"),
+    ("LEAK-KFOLD", HIGH, r"\b(KFold|StratifiedKFold|train_test_split|cross_val_score)\b",
+     "plain cross-validation leaks on time series; use a purged and embargoed split "
+     "(see references/out-of-sample.md)"),
+    ("LEAK-FIT-TRANSFORM", MED, r"\.fit_transform\(",
+     "confirm this scaler, ranker, or decomposition is fitted on the training window only; "
+     "fitting on the full panel leaks the future into every date"),
+    ("DDOF-DEFAULT", HIGH, r"np\.(std|var)\((?![^)]*ddof)",
+     "numpy std/var default to ddof=0; a sample statistic needs ddof=1, and a covariance matrix "
+     "must use one convention on its diagonal and off-diagonals"),
+    ("SILENT-FALLBACK", HIGH, r"except\s*(Exception|BaseException)?\s*(as\s+\w+)?\s*:",
+     "broad exception handling turns a failure into a number; a computation that cannot be "
+     "performed correctly must raise"),
+    ("SILENT-ZERO", HIGH, r"(return\s+0(\.0)?\s*$|\.fillna\(\s*0(\.0)?\s*\))",
+     "returning or filling zero for a failed or missing estimate makes an unknown "
+     "indistinguishable from a measurement; return None and let the caller handle it"),
+    ("ALIGN-POSITIONAL", HIGH, r"\.iloc\[\s*:\s*min_?len|\.iloc\[\s*:\s*min\(",
+     "positional truncation pairs one series' dates against another's; align on the date index "
+     "and assert the indices are equal"),
+    ("ALIGN-VALUES", MED, r"\.values\b.*\.values\b",
+     "operating on two .values arrays discards the index; alignment is no longer checked"),
+    ("HARDCODE-PERIODS", MED,
+     r"(?<![\w.])(252|260|365)(?![\w.])|sqrt\(\s*12\s*\)|(?<![\w.])/\s*12(?![\w.])",
+     "a periods-per-year literal outside the config; centralise it so every statistic agrees"),
+    ("HARDCODE-RF", MED, r"risk_free\w*\s*=\s*0\.\d+",
+     "a hardcoded risk-free rate; take it from the config and record the instrument and day count"),
+    ("HARDCODE-COST", MED, r"(bps|basis_points|cost)\w*\s*=\s*\d+(\.\d+)?",
+     "a hardcoded cost assumption; duplicate cost defaults in different modules produce "
+     "irreconcilable net returns"),
+    ("PLACEHOLDER", HIGH, r"#.*\b(placeholder|mock|dummy|fake|for now|hardcod|TODO|FIXME|XXX)\b",
+     "a placeholder implementation that returns a plausible constant is indistinguishable from a "
+     "measurement once it reaches a report"),
+    ("SEED-GLOBAL", MED, r"np\.random\.seed\(|numpy\.random\.seed\(",
+     "the legacy global seed makes results depend on execution order; use "
+     "numpy.random.default_rng(seed) and pass the generator explicitly"),
+    ("SEED-PYTHON-HASH", HIGH, r"\bhash\(\s*[\"']?\w+[\"']?\s*\)",
+     "Python's built-in hash on a string is salted per process; a seed derived from it is not "
+     "reproducible across runs"),
+    ("DROPNA-BLIND", MED, r"\.dropna\(\s*\)",
+     "an unqualified dropna silently changes the sample and therefore every annualisation; state "
+     "the axis and how, and report the count removed"),
+    ("SUM-RETURNS", HIGH, r"\b(returns?|rets?|r|pnl|active)\s*\.\s*sum\(\)",
+     "summing simple returns is not compounding; cumulative return is the product of (1 + r)"),
+    ("CORR-NAN-ZERO", HIGH, r"nan_to_num\(",
+     "replacing NaN with zero in a correlation or covariance matrix asserts independence where "
+     "there was no observation"),
+    ("MAGIC-MULTIPLIER", HIGH,
+     r"(cvar|es|expected_shortfall|var)\w*\s*=\s*\w*var\w*\s*\*\s*\d",
+     "expected shortfall as a fixed multiple of value-at-risk discards the tail shape that is the "
+     "reason to compute expected shortfall"),
+    ("PCT-CHANGE-TWICE", MED, r"\.pct_change\(\)\.pct_change\(\)",
+     "pct_change applied to an already-differenced series"),
+]
+
+AST_NOTES = {
+    "bare_except": (HIGH, "a bare except swallows every failure including a keyboard interrupt"),
+    "except_pass": (HIGH, "an exception handler whose body is pass or continue discards a failure "
+                          "with no record that it happened"),
+    "except_default": (HIGH, "an exception handler that returns a constant substitutes a "
+                             "fabricated value for a failed computation"),
+    "no_assert": (LOW, "no assertions in this file; alignment, weight-sum, and lag invariants are "
+                       "the cheapest defence against a plausible wrong number"),
+    "untyped": (MED, "public function without complete type annotations; a series of prices and a "
+                     "series of returns are the same type to the interpreter and different things "
+                     "to the analysis, and annotations are where that gets written down"),
+    "untyped_any": (MED, "explicit Any on a public signature defeats the type check at exactly the "
+                         "boundary it is meant to guard"),
+}
+
+
+def audit_source(path: Path, text: str):
+    findings = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped.startswith("#") and not re.search(
+                r"\b(placeholder|mock|dummy|fake|for now|hardcod|TODO|FIXME|XXX)\b",
+                stripped, re.I):
+            continue
+        for rid, sev, pattern, msg in LINE_RULES:
+            if re.search(pattern, line, re.I):
+                findings.append({"file": str(path), "line": i, "id": rid, "severity": sev,
+                                 "message": msg, "source": stripped[:160]})
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        findings.append({"file": str(path), "line": exc.lineno or 0, "id": "PARSE-ERROR",
+                         "severity": LOW, "message": f"could not parse: {exc.msg}", "source": ""})
+        return findings
+
+    has_assert = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert):
+            has_assert = True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and not node.name.startswith("_"):
+            args = [a for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+                    if a.arg not in ("self", "cls")]
+            missing = [a.arg for a in args if a.annotation is None]
+            if missing or node.returns is None:
+                sev, msg = AST_NOTES["untyped"]
+                what = ", ".join(missing) if missing else "return type"
+                findings.append({"file": str(path), "line": node.lineno, "id": "TYPE-MISSING",
+                                 "severity": sev, "message": f"{msg} ({node.name}: {what})",
+                                 "source": ""})
+            for a in args + ([node] if node.returns else []):
+                ann = a.annotation if isinstance(a, ast.arg) else a.returns
+                if isinstance(ann, ast.Name) and ann.id == "Any":
+                    sev, msg = AST_NOTES["untyped_any"]
+                    findings.append({"file": str(path), "line": node.lineno, "id": "TYPE-ANY",
+                                     "severity": sev, "message": f"{msg} ({node.name})",
+                                     "source": ""})
+                    break
+        if isinstance(node, ast.ExceptHandler):
+            if node.type is None:
+                sev, msg = AST_NOTES["bare_except"]
+                findings.append({"file": str(path), "line": node.lineno, "id": "EXCEPT-BARE",
+                                 "severity": sev, "message": msg, "source": ""})
+            body = node.body
+            if len(body) == 1 and isinstance(body[0], (ast.Pass, ast.Continue)):
+                sev, msg = AST_NOTES["except_pass"]
+                findings.append({"file": str(path), "line": node.lineno, "id": "EXCEPT-PASS",
+                                 "severity": sev, "message": msg, "source": ""})
+            if len(body) == 1 and isinstance(body[0], ast.Return) and \
+                    isinstance(body[0].value, ast.Constant):
+                sev, msg = AST_NOTES["except_default"]
+                val = body[0].value.value
+                findings.append({"file": str(path), "line": node.lineno, "id": "EXCEPT-DEFAULT",
+                                 "severity": sev, "message": f"{msg} (returns {val!r})",
+                                 "source": ""})
+    if not has_assert and len(lines) > 40:
+        sev, msg = AST_NOTES["no_assert"]
+        findings.append({"file": str(path), "line": 0, "id": "NO-ASSERT", "severity": sev,
+                         "message": msg, "source": ""})
+    return findings
+
+
+def collect(paths):
+    files = []
+    for p in paths:
+        path = Path(p)
+        if path.is_dir():
+            files.extend(sorted(
+                f for f in path.rglob("*.py")
+                if not any(part in {".venv", "venv", "site-packages", "__pycache__", ".git",
+                                    "node_modules", "build", "dist"} for part in f.parts)))
+        elif path.suffix == ".py":
+            files.append(path)
+        elif path.suffix == ".ipynb":
+            files.append(path)
+        else:
+            sys.stderr.write(f"pm-audit: skipping {path} (not .py or .ipynb)\n")
+    return files
+
+
+def read_source(path: Path) -> str:
+    if path.suffix == ".ipynb":
+        try:
+            nb = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            sys.stderr.write(f"pm-audit: could not read {path}: {exc}\n")
+            return ""
+        return "\n".join("".join(c.get("source", []))
+                         for c in nb.get("cells", []) if c.get("cell_type") == "code")
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="pm-audit", description=__doc__.split("\n")[0])
+    ap.add_argument("paths", nargs="+")
+    ap.add_argument("--severity", choices=(HIGH, MED, LOW), default=LOW,
+                    help="minimum severity to report (default: low, meaning everything)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    order = {HIGH: 0, MED: 1, LOW: 2}
+    files = collect(args.paths)
+    if not files:
+        sys.stderr.write("pm-audit: no Python or notebook files found\n")
+        return 2
+
+    findings = []
+    notebooks = []
+    for f in files:
+        src = read_source(f)
+        if not src:
+            continue
+        if f.suffix == ".ipynb":
+            notebooks.append(f)
+        findings.extend(audit_source(f, src))
+    findings = [x for x in findings if order[x["severity"]] <= order[args.severity]]
+    findings.sort(key=lambda x: (order[x["severity"]], x["file"], x["line"]))
+
+    if args.json:
+        print(json.dumps({"files_scanned": len(files), "findings": findings}, indent=2))
+        return 1 if any(x["severity"] == HIGH for x in findings) else 0
+
+    print(f"pm-audit: {len(files)} file(s) scanned, {len(findings)} finding(s)")
+    if notebooks:
+        print(f"  {len(notebooks)} notebook(s) scanned. Notebook state does not correspond to "
+              "notebook text; restart and run top to bottom before any number is used.")
+    print()
+    current = None
+    for x in findings:
+        if x["file"] != current:
+            current = x["file"]
+            print(current)
+        loc = f"{x['line']}" if x["line"] else "-"
+        print(f"  {x['severity']:<6} {x['id']:<22} :{loc}")
+        print(f"         {x['message']}")
+        if x["source"]:
+            print(f"         > {x['source']}")
+    counts = {s: sum(1 for x in findings if x["severity"] == s) for s in (HIGH, MED, LOW)}
+    print()
+    print(f"high {counts[HIGH]} | medium {counts[MED]} | low {counts[LOW]}")
+    print("This is a lint. A finding is a candidate for inspection, not a confirmed defect, and a "
+          "clean run is not evidence of correctness.")
+    print("It does not check what matters most. Run these too:")
+    print("  ruff check . && ruff format --check .")
+    print("  mypy --strict <package>")
+    print("  pytest --cov=<package> --cov-fail-under=80 --cov-report=term-missing")
+    print("  the golden test and the noise test: references/coding-standards.md")
+    return 1 if counts[HIGH] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

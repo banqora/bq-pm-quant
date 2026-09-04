@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Persist a desk's reporting and convention preferences so they are asked once, not every session.
+
+Anything the manager has already decided belongs here: the output format they want, where results
+go, and the conventions that would otherwise be re-litigated on every task. Read it at the start of
+a task; write to it the moment the manager states a preference.
+
+Resolution order, first hit wins per key:
+  1. ./.bq-pm-quant.json                       project, checked into the repo, shared by the desk
+  2. $BQ_PM_QUANT_PREFS                        explicit override
+  3. ~/.config/bq-pm-quant/preferences.json    per user
+
+Usage:
+  pm-prefs                             show the resolved preferences and where each came from
+  pm-prefs get <key>                   print one value, empty and exit 1 if unset
+  pm-prefs set <key> <value>           write to the user scope
+  pm-prefs set <key> <value> --project write to ./.bq-pm-quant.json instead
+  pm-prefs unset <key> [--project]
+  pm-prefs keys                        list known keys with their meaning and accepted values
+  pm-prefs init [--project]            create a commented starter file
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+KEYS = {
+    "output_format": ("How to deliver a large result",
+                      "console | csv | xlsx | html | json"),
+    "output_dir": ("Where result files are written", "a path, default ./results"),
+    "ask_format_threshold": ("Row count above which to ask about format, if unset",
+                             "an integer, default 20"),
+    "periods_per_year": ("Observations per year for annualisation", "252 | 12 | 52 | 4"),
+    "return_type": ("Return construction", "simple | log"),
+    "total_return": ("Total return or price return", "true | false"),
+    "risk_free": ("Risk-free instrument", "e.g. SOFR, ESTR, SONIA, UST3M, none"),
+    "risk_free_daycount": ("Conversion of the quoted rate to a period rate",
+                           "simple-annual | compounded"),
+    "base_currency": ("Reporting currency", "e.g. USD, EUR, GBP"),
+    "benchmark": ("Default benchmark for active statistics", "an identifier or a file path"),
+    "cost_bps_round_trip": ("Default round-trip cost assumption in basis points", "a number"),
+    "se_method": ("Default standard-error estimator",
+                  "iid | mertens | newey-west | bootstrap"),
+    "significance_hurdle_t": ("t-statistic hurdle for a new effect", "a number, e.g. 3.0"),
+    "trial_log": ("Path to the trial log", "a path, default ./TRIALS.md"),
+    "data_vintage": ("Snapshot identifier for the current data pull", "a date or a hash"),
+}
+
+USER_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) \
+    / "bq-pm-quant" / "preferences.json"
+PROJECT_PATH = Path.cwd() / ".bq-pm-quant.json"
+ENV_PATH = Path(os.environ["BQ_PM_QUANT_PREFS"]) if os.environ.get("BQ_PM_QUANT_PREFS") else None
+
+
+def _load(path: Path):
+    if not path or not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        sys.stderr.write(f"pm-prefs: cannot read {path}: {exc}\n")
+        return {}
+    if not isinstance(data, dict):
+        sys.stderr.write(f"pm-prefs: {path} is not a JSON object; ignoring\n")
+        return {}
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+def resolve():
+    sources = [(PROJECT_PATH, "project"), (ENV_PATH, "env"), (USER_PATH, "user")]
+    merged, origin = {}, {}
+    for path, label in sources:
+        for k, v in _load(path).items():
+            if k not in merged:
+                merged[k], origin[k] = v, f"{label} ({path})"
+    return merged, origin
+
+
+def _write(path: Path, updates, remove=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = {}
+    if path.is_file():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            sys.stderr.write(f"pm-prefs: {path} is unreadable; refusing to overwrite it. "
+                             "Fix or remove it first.\n")
+            raise SystemExit(1)
+    current.update(updates)
+    for k in (remove or []):
+        current.pop(k, None)
+    path.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def coerce(key, raw):
+    if key in ("periods_per_year", "ask_format_threshold"):
+        return int(raw)
+    if key in ("cost_bps_round_trip", "significance_hurdle_t"):
+        return float(raw)
+    if key == "total_return":
+        if raw.lower() not in ("true", "false"):
+            raise SystemExit(f"pm-prefs: {key} must be true or false")
+        return raw.lower() == "true"
+    return raw
+
+
+def main(argv):
+    if not argv:
+        merged, origin = resolve()
+        if not merged:
+            print("pm-prefs: no preferences set.")
+            print(f"  project: {PROJECT_PATH} {'(exists)' if PROJECT_PATH.is_file() else ''}")
+            print(f"  user:    {USER_PATH} {'(exists)' if USER_PATH.is_file() else ''}")
+            print("\nRun 'pm-prefs keys' to see what can be stored, then 'pm-prefs set <k> <v>'.")
+            print("Ask the manager once, store the answer, and stop asking.")
+            return 1
+        width = max(len(k) for k in merged)
+        for k in sorted(merged):
+            unknown = "" if k in KEYS else "   [unknown key]"
+            print(f"{k:<{width}}  {json.dumps(merged[k]):<24}  {origin[k]}{unknown}")
+        return 0
+
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+
+    if cmd == "keys":
+        width = max(len(k) for k in KEYS)
+        for k, (desc, vals) in KEYS.items():
+            print(f"{k:<{width}}  {desc}")
+            print(f"{'':<{width}}  values: {vals}")
+        return 0
+
+    if cmd == "get":
+        if len(rest) != 1:
+            raise SystemExit("usage: pm-prefs get <key>")
+        merged, _ = resolve()
+        if rest[0] not in merged:
+            return 1
+        v = merged[rest[0]]
+        print(v if isinstance(v, str) else json.dumps(v))
+        return 0
+
+    project = "--project" in rest
+    rest = [a for a in rest if a != "--project"]
+    target = PROJECT_PATH if project else USER_PATH
+
+    if cmd == "set":
+        if len(rest) < 2:
+            raise SystemExit("usage: pm-prefs set <key> <value> [--project]")
+        key, raw = rest[0], " ".join(rest[1:])
+        if key not in KEYS:
+            sys.stderr.write(f"pm-prefs: '{key}' is not a known key. Storing it anyway; run "
+                             "'pm-prefs keys' to see the documented set.\n")
+        path = _write(target, {key: coerce(key, raw)})
+        print(f"set {key} in {path}")
+        return 0
+
+    if cmd == "unset":
+        if len(rest) != 1:
+            raise SystemExit("usage: pm-prefs unset <key> [--project]")
+        path = _write(target, {}, remove=[rest[0]])
+        print(f"unset {rest[0]} in {path}")
+        return 0
+
+    if cmd == "init":
+        if target.is_file():
+            raise SystemExit(f"pm-prefs: {target} already exists; edit it or use 'set'")
+        starter = {
+            "_comment": ("Preferences for the bq-pm-quant skill. Anything set here is not asked "
+                         "again. Run 'pm-prefs keys' for the documented keys."),
+            "output_format": "csv",
+            "output_dir": "results",
+            "periods_per_year": 252,
+            "return_type": "simple",
+            "total_return": True,
+            "risk_free": "SOFR",
+            "risk_free_daycount": "simple-annual",
+            "base_currency": "USD",
+            "se_method": "mertens",
+            "significance_hurdle_t": 3.0,
+            "trial_log": "TRIALS.md",
+        }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(starter, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"wrote {target}")
+        print("Edit it, or overwrite individual keys with 'pm-prefs set'.")
+        return 0
+
+    raise SystemExit(f"pm-prefs: unknown command '{cmd}'. Run 'pm-prefs --help'.")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

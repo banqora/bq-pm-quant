@@ -1,0 +1,889 @@
+#!/usr/bin/env python3
+"""Correct performance statistics from a return or price series.
+
+Reference implementation. Every figure ships with the sample size, a standard error where one
+exists, and the convention used. Standard library only; no dependencies.
+
+Usage:
+  pm-stats <file.csv> [options]
+
+Options:
+  --date-col NAME       date column (default: auto-detect, else first column)
+  --value-col NAME      return or price column (default: auto-detect)
+  --is-price            treat the value column as a price/NAV level, not a return
+  --log-returns         input returns are log returns (converted to simple internally)
+  --rf RATE             annual risk-free rate as a decimal, e.g. 0.0525 (default 0.0)
+  --rf-col NAME         column holding the periodic risk-free rate instead of --rf
+  --periods-per-year K  default 252
+  --rf-daycount CONV    simple-annual (default) or compounded, for converting --rf to periodic
+  --trials N            number of specifications searched, for the deflated Sharpe ratio
+  --lo-max-lag L        max autocorrelation lag in the Lo adjustment (default min(5, T//20))
+  --benchmark FILE      second file, same format, for active statistics
+  --allow-extreme-returns  accept single-period returns above 150% as genuine
+  --json                emit JSON instead of the report block
+  --csv FILE            also write the metric table as CSV, with a convention header block
+  --out FILE            write the report block to a file as well as printing it
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+# --------------------------------------------------------------------------- distributions
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def norm_ppf(p: float) -> float:
+    """Inverse standard normal CDF (Acklam's rational approximation, refined by one Halley step)."""
+    if not 0.0 < p < 1.0:
+        raise ValueError("norm_ppf requires 0 < p < 1")
+    a = [-3.969683028665376e01, 2.209460984245205e02, -2.759285104469687e02,
+         1.383577518672690e02, -3.066479806614716e01, 2.506628277459239e00]
+    b = [-5.447609879822406e01, 1.615858368580409e02, -1.556989798598866e02,
+         6.680131188771972e01, -1.328068155288572e01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e00,
+         -2.549732539343734e00, 4.374664141464968e00, 2.938163982698783e00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e00,
+         3.754408661907416e00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        x = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    elif p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        x = -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    else:
+        q = p - 0.5
+        r = q * q
+        x = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+    e = norm_cdf(x) - p
+    u = e * math.sqrt(2 * math.pi) * math.exp(x * x / 2)
+    return x - u / (1 + x * u / 2)
+
+
+def _gammainc_upper_regularized(a: float, x: float) -> float:
+    """Regularized upper incomplete gamma Q(a, x). Series below the crossover, CF above."""
+    if x < 0 or a <= 0:
+        raise ValueError("invalid arguments")
+    if x == 0:
+        return 1.0
+    if x < a + 1.0:
+        ap, total, term = a, 1.0 / a, 1.0 / a
+        for _ in range(1000):
+            ap += 1.0
+            term *= x / ap
+            total += term
+            if abs(term) < abs(total) * 1e-15:
+                break
+        return 1.0 - total * math.exp(-x + a * math.log(x) - math.lgamma(a))
+    tiny = 1e-300
+    b, c, d = x + 1.0 - a, 1.0 / tiny, 1.0 / (x + 1.0 - a)
+    h = d
+    for i in range(1, 1000):
+        an = -i * (i - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
+
+
+def chi2_sf(x: float, df: int) -> float:
+    return _gammainc_upper_regularized(df / 2.0, x / 2.0)
+
+
+def t_sf_two_sided(t: float, df: int) -> float:
+    """Two-sided p-value for a Student-t statistic, via the incomplete beta identity."""
+    if df <= 0:
+        return float("nan")
+    x = df / (df + t * t)
+    return _betainc_regularized(df / 2.0, 0.5, x)
+
+
+def _betainc_regularized(a: float, b: float, x: float) -> float:
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    lbeta = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+    front = math.exp(a * math.log(x) + b * math.log(1 - x) - lbeta)
+    if x < (a + 1) / (a + b + 2):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - math.exp(b * math.log(1 - x) + a * math.log(x) - lbeta) * _betacf(b, a, 1 - x) / b
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, 300):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-14:
+            break
+    return h
+
+
+# --------------------------------------------------------------------------- moments
+
+
+def mean(xs):
+    return sum(xs) / len(xs)
+
+
+def variance(xs, ddof=1):
+    n = len(xs)
+    if n - ddof <= 0:
+        return float("nan")
+    m = mean(xs)
+    return sum((x - m) ** 2 for x in xs) / (n - ddof)
+
+
+def stdev(xs, ddof=1):
+    v = variance(xs, ddof)
+    return math.sqrt(v) if v == v and v >= 0 else float("nan")
+
+
+def _central_moment(xs, k):
+    m = mean(xs)
+    return sum((x - m) ** k for x in xs) / len(xs)
+
+
+def skewness(xs):
+    """Adjusted Fisher-Pearson sample skewness (matches scipy bias=False)."""
+    n = len(xs)
+    if n < 3:
+        return float("nan")
+    m2, m3 = _central_moment(xs, 2), _central_moment(xs, 3)
+    if m2 <= 0:
+        return float("nan")
+    g1 = m3 / m2 ** 1.5
+    return math.sqrt(n * (n - 1)) / (n - 2) * g1
+
+
+def excess_kurtosis(xs):
+    """Sample excess kurtosis, bias-corrected (matches scipy bias=False)."""
+    n = len(xs)
+    if n < 4:
+        return float("nan")
+    m2, m4 = _central_moment(xs, 2), _central_moment(xs, 4)
+    if m2 <= 0:
+        return float("nan")
+    g2 = m4 / m2 ** 2 - 3.0
+    return ((n - 1) / ((n - 2) * (n - 3))) * ((n + 1) * g2 + 6)
+
+
+def autocorr(xs, lag):
+    n = len(xs)
+    if lag >= n:
+        return float("nan")
+    m = mean(xs)
+    denom = sum((x - m) ** 2 for x in xs)
+    if denom == 0:
+        return float("nan")
+    num = sum((xs[t] - m) * (xs[t - lag] - m) for t in range(lag, n))
+    return num / denom
+
+
+def ljung_box(xs, h):
+    n = len(xs)
+    h = min(h, n - 1)
+    q = 0.0
+    for j in range(1, h + 1):
+        r = autocorr(xs, j)
+        if r != r:
+            continue
+        q += r * r / (n - j)
+    q *= n * (n + 2)
+    return q, h, chi2_sf(q, h)
+
+
+def newey_west_se_of_mean(xs, lag=None):
+    n = len(xs)
+    if lag is None:
+        lag = int(math.floor(4 * (n / 100.0) ** (2.0 / 9.0)))
+    lag = max(0, min(lag, n - 1))
+    m = mean(xs)
+    dev = [x - m for x in xs]
+    g0 = sum(d * d for d in dev) / n
+    s = g0
+    for j in range(1, lag + 1):
+        gj = sum(dev[t] * dev[t - j] for t in range(j, n)) / n
+        s += 2.0 * (1.0 - j / (lag + 1.0)) * gj
+    if s <= 0:
+        return float("nan"), lag
+    return math.sqrt(s / n), lag
+
+
+def percentile(sorted_xs, p):
+    """Linear-interpolation percentile on an already-sorted list. p in [0, 1]."""
+    n = len(sorted_xs)
+    if n == 0:
+        return float("nan")
+    if n == 1:
+        return sorted_xs[0]
+    idx = p * (n - 1)
+    lo = int(math.floor(idx))
+    hi = min(lo + 1, n - 1)
+    frac = idx - lo
+    return sorted_xs[lo] * (1 - frac) + sorted_xs[hi] * frac
+
+
+# --------------------------------------------------------------------------- statistics
+
+
+def sharpe_block(excess, k, lo_max_lag=None, trials=None):
+    t_n = len(excess)
+    mu = mean(excess)
+    sd = stdev(excess, ddof=1)
+    out = {"n": t_n, "mean_period": mu, "sd_period": sd}
+    if sd is None or sd != sd or sd == 0:
+        out["error"] = "zero or undefined standard deviation of excess returns"
+        return out
+
+    sr_p = mu / sd
+    g3 = skewness(excess)
+    g4x = excess_kurtosis(excess)
+    out["skew"] = g3
+    out["excess_kurtosis"] = g4x
+
+    se_iid_p = math.sqrt((1.0 + sr_p ** 2 / 2.0) / t_n)
+    var_mertens = (1.0 + sr_p ** 2 / 2.0 - g3 * sr_p + (g4x / 4.0) * sr_p ** 2) / t_n
+    se_mertens_p = math.sqrt(var_mertens) if var_mertens > 0 else float("nan")
+
+    rk = math.sqrt(k)
+    out["sharpe_ann"] = sr_p * rk
+    out["se_iid_ann"] = se_iid_p * rk
+    out["se_mertens_ann"] = se_mertens_p * rk if se_mertens_p == se_mertens_p else float("nan")
+    out["t_iid"] = sr_p / se_iid_p
+    out["t_mertens"] = (sr_p / se_mertens_p) if se_mertens_p == se_mertens_p and se_mertens_p > 0 \
+        else float("nan")
+
+    # Lo (2002) autocorrelation-adjusted annualisation, truncated at lo_max_lag.
+    #
+    # Each included lag contributes (k - j) * rho_j. With k = 252 that weight is roughly 250, while
+    # each rho_j carries a sampling standard error of about 1/sqrt(T) under the null. Including many
+    # lags therefore injects far more noise than signal: on an independent series with T = 2520,
+    # twenty lags move the adjusted Sharpe by roughly 10% purely from estimation error. Default to a
+    # small lag count and report whether the autocorrelation is distinguishable from zero at all.
+    if lo_max_lag is None:
+        lo_max_lag = max(1, min(5, t_n // 20))
+    lo_max_lag = min(lo_max_lag, k - 1, t_n - 1)
+    acc = 0.0
+    rhos = []
+    for j in range(1, lo_max_lag + 1):
+        r = autocorr(excess, j)
+        if r != r:
+            r = 0.0
+        rhos.append(r)
+        acc += (k - j) * r
+    out["rho_se_under_null"] = 1.0 / math.sqrt(t_n)
+    lb_q, lb_df, lb_p = ljung_box(excess, lo_max_lag)
+    out["lo_ljung_box_p"] = lb_p
+    denom = k + 2.0 * acc
+    out["lo_max_lag"] = lo_max_lag
+    out["autocorr"] = rhos[:5]
+    if denom > 0:
+        scale = k / math.sqrt(denom)
+        out["sharpe_ann_lo"] = sr_p * scale
+        out["se_iid_ann_lo"] = se_iid_p * scale
+    else:
+        out["sharpe_ann_lo"] = float("nan")
+        out["se_iid_ann_lo"] = float("nan")
+        out["lo_warning"] = "negative variance ratio; autocorrelation structure unsuitable for Lo"
+
+    # Probabilistic Sharpe against zero, and deflated Sharpe when a trial count is supplied.
+    psr_den = 1.0 - g3 * sr_p + ((g4x + 3.0 - 1.0) / 4.0) * sr_p ** 2
+    if psr_den > 0 and t_n > 1:
+        out["psr_vs_zero"] = norm_cdf(sr_p * math.sqrt(t_n - 1) / math.sqrt(psr_den))
+    if trials and trials > 1 and psr_den > 0 and t_n > 1:
+        gam = 0.5772156649015329
+        v = se_iid_p  # dispersion proxy: SE of a single Sharpe, absent the trial return matrix
+        sr0 = v * ((1 - gam) * norm_ppf(1 - 1.0 / trials) +
+                   gam * norm_ppf(1 - 1.0 / (trials * math.e)))
+        out["sr0_period"] = sr0
+        out["sr0_ann"] = sr0 * rk
+        out["deflated_sharpe"] = norm_cdf((sr_p - sr0) * math.sqrt(t_n - 1) / math.sqrt(psr_den))
+        out["deflation_note"] = ("dispersion of trial Sharpes approximated by the single-estimate "
+                                 "SE; supply the trial return matrix for the exact statistic")
+    # Minimum track record length to clear zero at 95%.
+    if sr_p > 0 and psr_den > 0:
+        out["min_trl_periods"] = 1 + psr_den * (norm_ppf(0.95) / sr_p) ** 2
+    return out
+
+
+def drawdown(returns, dates):
+    wealth, peak = 1.0, 1.0
+    peak_i, worst, worst_i, worst_peak_i = 0, 0.0, 0, 0
+    for i, r in enumerate(returns):
+        wealth *= (1.0 + r)
+        if wealth > peak:
+            peak, peak_i = wealth, i
+        dd = wealth / peak - 1.0
+        if dd < worst:
+            worst, worst_i, worst_peak_i = dd, i, peak_i
+    rec_i = None
+    if worst < 0:
+        w, pk = 1.0, 1.0
+        for i, r in enumerate(returns):
+            w *= (1.0 + r)
+            pk = max(pk, w)
+            if i > worst_i and w >= pk and abs(w - pk) < 1e-12:
+                rec_i = i
+                break
+    return {
+        "max_drawdown": worst,
+        "peak_date": dates[worst_peak_i] if dates else None,
+        "trough_date": dates[worst_i] if dates else None,
+        "recovery_date": dates[rec_i] if rec_i is not None and dates else None,
+        "underwater_periods": (worst_i - worst_peak_i),
+    }
+
+
+def integrity(returns, dates):
+    n = len(returns)
+    zeros = sum(1 for r in returns if r == 0.0)
+    longest_run, run = 0, 0
+    for i in range(1, n):
+        if returns[i] == 0.0:
+            run += 1
+            longest_run = max(longest_run, run)
+        else:
+            run = 0
+    extremes = [(str(dates[i]) if dates else str(i), round(returns[i], 4))
+                for i in range(n) if abs(returns[i]) > 0.5]
+    weekend = 0
+    if dates and isinstance(dates[0], date):
+        weekend = sum(1 for d in dates if d.weekday() >= 5)
+    dup = 0
+    monotonic = True
+    if dates:
+        for i in range(1, len(dates)):
+            if dates[i] == dates[i - 1]:
+                dup += 1
+            if dates[i] < dates[i - 1]:
+                monotonic = False
+    return {
+        "n": n,
+        "zero_returns": zeros,
+        "zero_return_pct": zeros / n if n else float("nan"),
+        "longest_zero_run": longest_run,
+        "extreme_moves_gt_50pct": extremes[:20],
+        "n_extreme_moves": len(extremes),
+        "weekend_rows": weekend,
+        "duplicate_dates": dup,
+        "dates_monotonic": monotonic,
+    }
+
+
+# --------------------------------------------------------------------------- io
+
+
+DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y", "%Y%m%d")
+RETURN_NAMES = ("return", "returns", "ret", "r", "pnl_pct", "daily_return")
+PRICE_NAMES = ("price", "close", "adj_close", "adjusted_close", "nav", "level", "value")
+
+
+def parse_date(s):
+    s = s.strip()
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def load_series(path, date_col, value_col, is_price, log_returns, rf_col,
+                allow_extreme=False):
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        raise SystemExit(f"pm-stats: {path} contains no data rows")
+    headers = list(rows[0].keys())
+    lower = {h.lower().strip(): h for h in headers}
+
+    if date_col is None:
+        date_col = next((lower[c] for c in ("date", "dt", "timestamp", "day") if c in lower),
+                        headers[0])
+    if value_col is None:
+        cand = next((lower[c] for c in RETURN_NAMES if c in lower), None)
+        if cand is None:
+            cand = next((lower[c] for c in PRICE_NAMES if c in lower), None)
+            if cand is not None:
+                is_price = True
+        if cand is None:
+            others = [h for h in headers if h != date_col]
+            if len(others) != 1:
+                raise SystemExit(
+                    f"pm-stats: cannot infer the value column from {headers}. Pass --value-col.")
+            cand = others[0]
+        value_col = cand
+
+    dates, vals, rfs = [], [], []
+    skipped_blank, skipped_unparsable, skipped_rf = 0, 0, 0
+    for row in rows:
+        raw = (row.get(value_col) or "").strip()
+        if raw == "" or raw.lower() in ("na", "nan", "null", "none"):
+            skipped_blank += 1
+            continue
+        try:
+            v = float(raw)
+        except ValueError:
+            skipped_unparsable += 1
+            continue
+        if v != v:
+            skipped_blank += 1
+            continue
+        d = parse_date(row.get(date_col, "") or "")
+        dates.append(d)
+        vals.append(v)
+        if rf_col:
+            rf_raw = (row.get(rf_col) or "").strip()
+            try:
+                rfs.append(float(rf_raw))
+            except ValueError:
+                skipped_rf += 1
+                rfs.append(float("nan"))
+    if skipped_unparsable:
+        raise SystemExit(
+            f"pm-stats: {skipped_unparsable} row(s) in {path} have a non-numeric value in column "
+            f"'{value_col}' and cannot be parsed. Fix or remove them; they are not silently "
+            f"dropped, because dropping rows changes n and therefore every annualisation.")
+    if skipped_rf:
+        raise SystemExit(
+            f"pm-stats: {skipped_rf} row(s) have a non-numeric value in the risk-free column "
+            f"'{rf_col}'. Excess returns cannot be formed for those dates.")
+    n_dateless = sum(1 for d in dates if d is None)
+    if n_dateless:
+        sys.stderr.write(
+            f"pm-stats: {n_dateless} of {len(dates)} rows have an unrecognised date format. "
+            "Date-based checks (weekend rows, duplicate dates, monotonicity, benchmark alignment) "
+            "are DISABLED for this run and the drawdown dates are unavailable.\n")
+        dates = []
+    skipped = {"blank_or_nan": skipped_blank, "unparsable": skipped_unparsable}
+
+    if is_price:
+        rets = [vals[i] / vals[i - 1] - 1.0 for i in range(1, len(vals)) if vals[i - 1] != 0]
+        dates = dates[1:] if dates else []
+        rfs = rfs[1:] if rfs else []
+    else:
+        rets = [math.expm1(v) for v in vals] if log_returns else vals
+
+    if len(rets) < 2:
+        raise SystemExit("pm-stats: fewer than two usable observations")
+    worst = max(abs(r) for r in rets)
+    if worst > 1.5 and not allow_extreme:
+        raise SystemExit(
+            f"pm-stats: the largest absolute value in '{value_col}' is {worst:.4g}, which is "
+            f"{worst * 100:.0f}% as a decimal return. Either the series is in percent rather than "
+            "decimals, or it contains an unadjusted corporate action. This tool will not guess: "
+            "rescale the input, fix the data, or pass --allow-extreme-returns if the values are "
+            "genuinely decimal returns of that size.")
+    return dates, rets, rfs, value_col, is_price, skipped
+
+
+def periodic_rf(annual_rate, k, convention):
+    if annual_rate == 0:
+        return 0.0
+    if convention == "compounded":
+        return (1.0 + annual_rate) ** (1.0 / k) - 1.0
+    return annual_rate / k
+
+
+# --------------------------------------------------------------------------- report
+
+
+def fmt(x, pct=False, dp=4):
+    if x is None:
+        return "-"
+    if isinstance(x, (int,)) and not isinstance(x, bool):
+        return str(x)
+    if isinstance(x, float):
+        if x != x:
+            return "nan"
+        if pct:
+            return f"{x * 100:.2f}%"
+        return f"{x:.{dp}f}"
+    return str(x)
+
+
+def report(res):
+    c, s, d, ig = res["config"], res["sharpe"], res["drawdown"], res["integrity"]
+    lines = []
+    lines.append(f"window {c['first_date']}..{c['last_date']} | n={s['n']} | "
+                 f"k={c['periods_per_year']} | ddof=1 | {c['return_type']} returns")
+    lines.append(f"risk-free {c['rf_desc']} | source {c['source']} | column {c['value_col']}")
+    ex = c.get("excluded_rows", {})
+    if ex.get("blank_or_nan"):
+        lines.append(f"EXCLUDED {ex['blank_or_nan']} blank or NaN row(s). n above is the retained "
+                     f"count; the window is not contiguous.")
+    lines.append("")
+    lines.append(f"{'metric':<28}{'value':>12}{'se':>12}{'t':>9}  method")
+    lines.append("-" * 78)
+    rows = [
+        ("ann. arithmetic excess", fmt(res["ann_arith_excess"], pct=True),
+         fmt(res["se_ann_mean_nw"], pct=True), fmt(res["t_mean_nw"], dp=2),
+         f"Newey-West L={res['nw_lag']}"),
+        ("ann. geometric (CAGR)", fmt(res["cagr"], pct=True), "-", "-", "compounded, total"),
+        ("ann. volatility", fmt(res["ann_vol"], pct=True), "-", "-", "ddof=1"),
+        ("Sharpe (ann.)", fmt(s.get("sharpe_ann"), dp=3), fmt(s.get("se_iid_ann"), dp=3),
+         fmt(s.get("t_iid"), dp=2), "iid normal"),
+        ("Sharpe (ann.)", fmt(s.get("sharpe_ann"), dp=3), fmt(s.get("se_mertens_ann"), dp=3),
+         fmt(s.get("t_mertens"), dp=2),
+         f"Mertens (skew {fmt(s.get('skew'), dp=2)}, exkurt {fmt(s.get('excess_kurtosis'), dp=2)})"),
+        ("Sharpe (ann., Lo)", fmt(s.get("sharpe_ann_lo"), dp=3), fmt(s.get("se_iid_ann_lo"), dp=3),
+         "-", f"AR-adjusted, lags<={s.get('lo_max_lag')}"),
+    ]
+    for r in rows:
+        lines.append(f"{r[0]:<28}{r[1]:>12}{r[2]:>12}{r[3]:>9}  {r[4]}")
+    lines.append("")
+    lines.append(f"{'max drawdown':<28}{fmt(d['max_drawdown'], pct=True):>12}"
+                 f"   peak {d['peak_date']} trough {d['trough_date']} "
+                 f"recovery {d['recovery_date'] or 'not recovered'}")
+    lines.append(f"{'hist. VaR 95 (1p)':<28}{fmt(res['var95'], pct=True):>12}"
+                 f"   ES {fmt(res['es95'], pct=True)}")
+    lines.append(f"{'hist. VaR 99 (1p)':<28}{fmt(res['var99'], pct=True):>12}"
+                 f"   ES {fmt(res['es99'], pct=True)}")
+    lines.append(f"{'hit rate':<28}{fmt(res['hit_rate'], pct=True):>12}"
+                 f"   win/loss magnitude {fmt(res['win_loss_ratio'], dp=2)}")
+    ac = ", ".join(fmt(a, dp=3) for a in s.get("autocorr", []))
+    lines.append(f"{'autocorr lags 1-5':<28}{ac}"
+                 f"   (SE under null {fmt(s.get('rho_se_under_null'), dp=3)})")
+    lines.append(f"{'Ljung-Box(10)':<28}Q={fmt(res['lb_q'], dp=2)} df={res['lb_df']} "
+                 f"p={fmt(res['lb_p'], dp=4)}")
+    if "psr_vs_zero" in s:
+        lines.append(f"{'PSR vs 0':<28}{fmt(s['psr_vs_zero'], dp=4)}")
+    if "deflated_sharpe" in s:
+        lines.append(f"{'deflated Sharpe':<28}{fmt(s['deflated_sharpe'], dp=4)}"
+                     f"   trials={c['trials']} SR0(ann)={fmt(s.get('sr0_ann'), dp=3)}")
+        lines.append(f"{'':<28}{s['deflation_note']}")
+    if "min_trl_periods" in s:
+        yrs = s["min_trl_periods"] / c["periods_per_year"]
+        lines.append(f"{'min track record (95%)':<28}{s['min_trl_periods']:.0f} periods "
+                     f"({yrs:.1f} years) to clear zero")
+    if res.get("active"):
+        a = res["active"]
+        lines.append("")
+        lines.append(f"{'ann. active return':<28}{fmt(a['ann_active'], pct=True):>12}")
+        lines.append(f"{'tracking error (ann.)':<28}{fmt(a['te'], pct=True):>12}")
+        lines.append(f"{'information ratio':<28}{fmt(a['ir'], dp=3):>12}"
+                     f"{fmt(a['se_ir'], dp=3):>12}{fmt(a['t_ir'], dp=2):>9}  iid normal")
+        lines.append(f"{'beta vs benchmark':<28}{fmt(a['beta'], dp=3):>12}"
+                     f"   n overlap {a['n_overlap']}")
+    lines.append("")
+    lines.append("integrity")
+    lines.append(f"  zero returns {ig['zero_returns']} ({fmt(ig['zero_return_pct'], pct=True)}), "
+                 f"longest zero run {ig['longest_zero_run']}")
+    lines.append(f"  |return| > 50%: {ig['n_extreme_moves']}"
+                 + (f"  {ig['extreme_moves_gt_50pct'][:5]}" if ig['n_extreme_moves'] else ""))
+    lines.append(f"  weekend rows {ig['weekend_rows']} | duplicate dates {ig['duplicate_dates']} "
+                 f"| monotonic {ig['dates_monotonic']}")
+    flags = []
+    if ig["zero_return_pct"] == ig["zero_return_pct"] and ig["zero_return_pct"] > 0.05:
+        flags.append("more than 5% exact-zero returns: check for forward-filled or stale prices")
+    if ig["longest_zero_run"] >= 5:
+        flags.append(f"a run of {ig['longest_zero_run']} consecutive zero returns: stale price")
+    if ig["n_extreme_moves"]:
+        flags.append("single-period moves above 50%: check for unadjusted corporate actions")
+    if ig["weekend_rows"]:
+        flags.append("weekend rows present: check the exchange calendar")
+    if ig["duplicate_dates"] or not ig["dates_monotonic"]:
+        flags.append("date index is not unique and monotonic")
+    if s.get("sharpe_ann", 0) == s.get("sharpe_ann", 0) and abs(s.get("sharpe_ann", 0)) > 3 \
+            and c["periods_per_year"] >= 252:
+        flags.append("annualised Sharpe above 3 on daily data: treat as a lag defect until the "
+                     "timing contract is verified")
+    if s.get("autocorr") and abs(s["autocorr"][0]) > 0.1:
+        flags.append("lag-1 autocorrelation above 0.1: use the Lo-adjusted Sharpe as the headline")
+    lbp = s.get("lo_ljung_box_p")
+    if lbp is not None and lbp > 0.10:
+        flags.append(f"Ljung-Box over the Lo lags does not reject independence (p={lbp:.3f}); the "
+                     "gap between the naive and Lo-adjusted Sharpe is estimation noise, not an "
+                     "autocorrelation correction. Report the naive figure as the headline")
+    if not c["trials"]:
+        flags.append("no trial count supplied: the p-values above are uncorrected for search")
+    if flags:
+        lines.append("")
+        lines.append("flags")
+        for f in flags:
+            lines.append(f"  - {f}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- main
+
+
+def load_prefs():
+    """Defaults from the desk's stored preferences (see pm-prefs). Explicit flags always win."""
+    candidates = []
+    proj = Path.cwd() / ".bq-pm-quant.json"
+    env = os.environ.get("BQ_PM_QUANT_PREFS")
+    user = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) \
+        / "bq-pm-quant" / "preferences.json"
+    for path in (proj, Path(env) if env else None, user):
+        if path and path.is_file():
+            candidates.append(path)
+    merged, srcs = {}, []
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            sys.stderr.write(f"pm-stats: ignoring unreadable preferences at {path}: {exc}\n")
+            continue
+        if not isinstance(data, dict):
+            continue
+        srcs.append(str(path))
+        for k, v in data.items():
+            merged.setdefault(k, v)
+    return merged, srcs
+
+
+def write_csv(path, res):
+    """Metric table with the conventions carried in a header block, per analyst-conduct.md."""
+    c, s, d = res["config"], res["sharpe"], res["drawdown"]
+    rows = [
+        ("ann_arithmetic_excess", res["ann_arith_excess"], res["se_ann_mean_nw"],
+         res["t_mean_nw"], f"Newey-West L={res['nw_lag']}"),
+        ("ann_geometric_cagr", res["cagr"], None, None, "compounded"),
+        ("ann_volatility", res["ann_vol"], None, None, "ddof=1"),
+        ("sharpe_ann", s.get("sharpe_ann"), s.get("se_iid_ann"), s.get("t_iid"), "iid normal"),
+        ("sharpe_ann", s.get("sharpe_ann"), s.get("se_mertens_ann"), s.get("t_mertens"),
+         "Mertens non-normal"),
+        ("sharpe_ann_lo", s.get("sharpe_ann_lo"), s.get("se_iid_ann_lo"), None,
+         f"Lo AR-adjusted, lags<={s.get('lo_max_lag')}"),
+        ("max_drawdown", d["max_drawdown"], None, None,
+         f"peak {d['peak_date']} trough {d['trough_date']} "
+         f"recovery {d['recovery_date'] or 'not recovered'}"),
+        ("hist_var_95_1p", res["var95"], None, None, "historical"),
+        ("hist_es_95_1p", res["es95"], None, None, "historical"),
+        ("hist_var_99_1p", res["var99"], None, None, "historical"),
+        ("hist_es_99_1p", res["es99"], None, None, "historical"),
+        ("hit_rate", res["hit_rate"], None, None, "fraction of positive periods"),
+        ("win_loss_magnitude", res["win_loss_ratio"], None, None, "mean win / |mean loss|"),
+        ("skewness", s.get("skew"), None, None, "bias-corrected"),
+        ("excess_kurtosis", s.get("excess_kurtosis"), None, None, "bias-corrected"),
+        ("psr_vs_zero", s.get("psr_vs_zero"), None, None, "probabilistic Sharpe"),
+        ("deflated_sharpe", s.get("deflated_sharpe"), None, None,
+         f"trials={c['trials']}" if c.get("trials") else "trial count not supplied"),
+    ]
+    if res.get("active"):
+        a = res["active"]
+        rows += [
+            ("ann_active_return", a["ann_active"], None, None, "vs benchmark"),
+            ("tracking_error_ann", a["te"], None, None, "ex-post, ddof=1"),
+            ("information_ratio", a["ir"], a["se_ir"], a["t_ir"], "iid normal"),
+            ("beta_vs_benchmark", a["beta"], None, None, f"n overlap {a['n_overlap']}"),
+        ]
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        for k, v in [
+            ("# source", c["source"]), ("# value_column", c["value_col"]),
+            ("# window", f"{c['first_date']}..{c['last_date']}"), ("# n", s.get("n")),
+            ("# periods_per_year", c["periods_per_year"]), ("# return_type", c["return_type"]),
+            ("# risk_free", c["rf_desc"]), ("# ddof", 1),
+            ("# trials_searched", c.get("trials") or "NOT SUPPLIED - p-values uncorrected"),
+            ("# excluded_rows", json.dumps(c.get("excluded_rows", {}))),
+            ("# gross_or_net", "as supplied in the input series; not adjusted by this tool"),
+            ("# data_vintage", "record the snapshot date of the input file here"),
+        ]:
+            w.writerow([k, v])
+        w.writerow([])
+        w.writerow(["metric", "value", "se", "t", "method"])
+        for name, val, se, t, method in rows:
+            if val is None:
+                continue
+            w.writerow([name,
+                        "" if val != val else f"{val:.10g}",
+                        "" if se is None or se != se else f"{se:.10g}",
+                        "" if t is None or t != t else f"{t:.10g}",
+                        method])
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="pm-stats", add_help=True,
+                                 description=__doc__.split("\n")[0])
+    ap.add_argument("file")
+    ap.add_argument("--date-col")
+    ap.add_argument("--value-col")
+    ap.add_argument("--is-price", action="store_true")
+    ap.add_argument("--log-returns", action="store_true")
+    ap.add_argument("--rf", type=float, default=0.0)
+    ap.add_argument("--rf-col")
+    ap.add_argument("--periods-per-year", type=int, default=252)
+    ap.add_argument("--rf-daycount", choices=("simple-annual", "compounded"),
+                    default="simple-annual")
+    ap.add_argument("--trials", type=int)
+    ap.add_argument("--lo-max-lag", type=int)
+    ap.add_argument("--benchmark")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--allow-extreme-returns", action="store_true",
+                    help="accept single-period returns above 150%% as genuine")
+    ap.add_argument("--csv")
+    ap.add_argument("--out")
+    args = ap.parse_args(argv)
+
+    prefs, pref_sources = load_prefs()
+    if "periods_per_year" in prefs and not any(
+            a.startswith("--periods-per-year") for a in (argv or sys.argv[1:])):
+        args.periods_per_year = int(prefs["periods_per_year"])
+    if "rf_daycount" not in prefs and "risk_free_daycount" in prefs and not any(
+            a.startswith("--rf-daycount") for a in (argv or sys.argv[1:])):
+        if prefs["risk_free_daycount"] in ("simple-annual", "compounded"):
+            args.rf_daycount = prefs["risk_free_daycount"]
+    if prefs.get("return_type") == "log" and not args.log_returns and not args.is_price:
+        args.log_returns = True
+    if pref_sources:
+        sys.stderr.write("pm-stats: defaults from " + ", ".join(pref_sources) + "\n")
+
+    k = args.periods_per_year
+    dates, rets, rfs, value_col, was_price, skipped = load_series(
+        args.file, args.date_col, args.value_col, args.is_price, args.log_returns,
+        args.rf_col, args.allow_extreme_returns)
+
+    if rfs and len(rfs) == len(rets):
+        excess = [rets[i] - rfs[i] for i in range(len(rets))]
+        rf_desc = f"column {args.rf_col} (periodic)"
+    else:
+        rf_p = periodic_rf(args.rf, k, args.rf_daycount)
+        excess = [r - rf_p for r in rets]
+        rf_desc = (f"{args.rf:.4%} annual, {args.rf_daycount}, {rf_p:.8f} per period"
+                   if args.rf else "0.00% (raw returns; Sharpe is not excess-based)")
+
+    assert len(excess) == len(rets), "excess and raw return series lengths diverged"
+    assert not dates or len(dates) == len(rets), "date index and return series lengths differ"
+    assert k > 0, "periods-per-year must be positive"
+    s = sharpe_block(excess, k, args.lo_max_lag, args.trials)
+    dd = drawdown(rets, dates)
+    ig = integrity(rets, dates)
+
+    total = 1.0
+    for r in rets:
+        total *= (1.0 + r)
+    years = len(rets) / k
+    cagr = total ** (1.0 / years) - 1.0 if years > 0 and total > 0 else float("nan")
+    se_mean, nw_lag = newey_west_se_of_mean(excess)
+    srt = sorted(rets)
+    tail95 = [x for x in srt if x <= percentile(srt, 0.05)] or [srt[0]]
+    tail99 = [x for x in srt if x <= percentile(srt, 0.01)] or [srt[0]]
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r < 0]
+    lb_q, lb_df, lb_p = ljung_box(rets, 10)
+
+    res = {
+        "config": {
+            "source": args.file, "value_col": value_col,
+            "return_type": "price-derived simple" if was_price
+                           else ("log-converted simple" if args.log_returns else "simple"),
+            "periods_per_year": k, "rf_desc": rf_desc, "trials": args.trials,
+            "excluded_rows": skipped,
+            "first_date": str(dates[0]) if dates else "?",
+            "last_date": str(dates[-1]) if dates else "?",
+        },
+        "ann_arith_excess": mean(excess) * k,
+        "se_ann_mean_nw": se_mean * k,
+        "t_mean_nw": mean(excess) / se_mean if se_mean == se_mean and se_mean > 0 else float("nan"),
+        "nw_lag": nw_lag,
+        "cagr": cagr,
+        "ann_vol": stdev(rets, ddof=1) * math.sqrt(k),
+        "sharpe": s,
+        "drawdown": dd,
+        "integrity": ig,
+        "var95": percentile(srt, 0.05), "es95": mean(tail95),
+        "var99": percentile(srt, 0.01), "es99": mean(tail99),
+        "hit_rate": len(wins) / len(rets),
+        "win_loss_ratio": (mean(wins) / abs(mean(losses))) if wins and losses else float("nan"),
+        "lb_q": lb_q, "lb_df": lb_df, "lb_p": lb_p,
+    }
+
+    if args.benchmark:
+        bd, br, _, _, _, _ = load_series(args.benchmark, args.date_col, args.value_col,
+                                         args.is_price, args.log_returns, None,
+                                         args.allow_extreme_returns)
+        if dates and bd:
+            bmap = dict(zip(bd, br))
+            pairs = [(rets[i], bmap[dates[i]]) for i in range(len(dates)) if dates[i] in bmap]
+        else:
+            n = min(len(rets), len(br))
+            sys.stderr.write("pm-stats: benchmark has no parsable dates; aligning from the END "
+                             "of both series. Verify this is intended.\n")
+            pairs = list(zip(rets[-n:], br[-n:]))
+        if len(pairs) >= 20:
+            act = [p - b for p, b in pairs]
+            pr = [p for p, _ in pairs]
+            bb = [b for _, b in pairs]
+            te = stdev(act, ddof=1) * math.sqrt(k)
+            ir_p = mean(act) / stdev(act, ddof=1) if stdev(act, ddof=1) > 0 else float("nan")
+            n_ov = len(pairs)
+            mb, mp = mean(bb), mean(pr)
+            cov = sum((pr[i] - mp) * (bb[i] - mb) for i in range(n_ov)) / (n_ov - 1)
+            vb = sum((b - mb) ** 2 for b in bb) / (n_ov - 1)
+            se_ir = math.sqrt((1 + ir_p ** 2 / 2) / n_ov) * math.sqrt(k)
+            res["active"] = {
+                "ann_active": mean(act) * k, "te": te, "ir": ir_p * math.sqrt(k),
+                "se_ir": se_ir, "t_ir": ir_p * math.sqrt(n_ov),
+                "beta": cov / vb if vb > 0 else float("nan"), "n_overlap": n_ov,
+            }
+        else:
+            sys.stderr.write(f"pm-stats: only {len(pairs)} overlapping observations with the "
+                             "benchmark; active statistics not computed.\n")
+
+    text = report(res)
+    if args.json:
+        print(json.dumps(res, indent=2, default=str))
+    else:
+        print(text)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        sys.stderr.write(f"pm-stats: report written to {args.out}\n")
+    if args.csv:
+        write_csv(args.csv, res)
+        sys.stderr.write(f"pm-stats: metric table written to {args.csv}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

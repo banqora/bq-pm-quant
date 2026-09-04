@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Validate the portable skill structure: frontmatter, references, scripts, and cross-links.
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+skill_root="$repo_root/skills/bq-pm-quant"
+
+case "${1:-}" in
+  --static | "") ;;
+  -h | --help) echo "Usage: check-skill [--static]"; exit 0 ;;
+  *) echo "check-skill: unknown option '$1'" >&2; exit 1 ;;
+esac
+
+for s in pm-docs pm-stats pm-audit pm-prefs; do
+  path="$skill_root/scripts/$s"
+  if [[ ! -f "$path" || ! -x "$path" ]]; then
+    echo "check-skill: skills/bq-pm-quant/scripts/$s is missing or not executable" >&2
+    exit 1
+  fi
+  python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$path"
+done
+
+python3 - "$skill_root" "$repo_root" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+skill_root, repo_root = Path(sys.argv[1]), Path(sys.argv[2])
+errors = []
+
+skill_md = skill_root / "SKILL.md"
+text = skill_md.read_text(encoding="utf-8")
+
+m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+if not m:
+    errors.append("SKILL.md has no YAML frontmatter block")
+else:
+    fm = m.group(1)
+    name = re.search(r"^name:\s*(\S+)\s*$", fm, re.M)
+    desc = re.search(r"^description:\s*(.+)$", fm, re.M)
+    if not name or name.group(1) != "bq-pm-quant":
+        errors.append(f"SKILL.md name must be 'bq-pm-quant', got {name.group(1) if name else None}")
+    if not desc:
+        errors.append("SKILL.md has no description")
+    else:
+        d = desc.group(1).strip()
+        if len(d) < 200:
+            errors.append(f"SKILL.md description is {len(d)} chars; too thin to trigger reliably")
+        if len(d) > 1500:
+            errors.append(f"SKILL.md description is {len(d)} chars; over the practical limit")
+    for key in fm.splitlines():
+        k = key.split(":", 1)[0].strip()
+        if k and k not in ("name", "description"):
+            errors.append(f"SKILL.md frontmatter has unsupported key '{k}'")
+
+refs_dir = skill_root / "references"
+on_disk = {p.name for p in refs_dir.glob("*.md")}
+linked = set(re.findall(r"\(references/([a-z0-9-]+\.md)", text))
+for missing in sorted(linked - on_disk):
+    errors.append(f"SKILL.md links references/{missing}, which does not exist")
+for orphan in sorted(on_disk - linked):
+    errors.append(f"references/{orphan} exists but SKILL.md never links it")
+
+# every intra-reference link must resolve, including its anchor
+def slug(heading):
+    s = heading.strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    return re.sub(r"[\s_]+", "-", s).strip("-")
+
+anchors = {}
+for p in refs_dir.glob("*.md"):
+    body = p.read_text(encoding="utf-8")
+    anchors[p.name] = {slug(h) for h in re.findall(r"^#{1,6}\s+(.+)$", body, re.M)}
+
+for p in list(refs_dir.glob("*.md")) + [skill_md]:
+    body = p.read_text(encoding="utf-8")
+    for target in re.findall(r"\]\((?!https?://)([^)\s]+)\)", body):
+        path_part, _, anchor = target.partition("#")
+        path_part = path_part.replace("references/", "")
+        if not path_part:
+            continue
+        if path_part not in anchors:
+            errors.append(f"{p.name} links '{target}', but {path_part} does not exist")
+            continue
+        if anchor and anchor not in anchors[path_part]:
+            errors.append(f"{p.name} links '{target}', but that anchor is not a heading in "
+                          f"{path_part}")
+
+# pm-docs must know about every reference
+docs = (skill_root / "scripts" / "pm-docs").read_text(encoding="utf-8")
+for name in sorted(on_disk):
+    if f'"{name}"' not in docs:
+        errors.append(f"scripts/pm-docs has no routing entry for references/{name}")
+
+readme = (repo_root / "README.md").read_text(encoding="utf-8")
+for name in sorted(on_disk):
+    if name not in readme:
+        errors.append(f"README.md does not list references/{name}")
+
+for manifest, expected in [
+        (repo_root / ".claude-plugin" / "marketplace.json", "bq-pm-quant"),
+        (skill_root / ".claude-plugin" / "plugin.json", "bq-pm-quant")]:
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    if data.get("name") != expected:
+        errors.append(f"{manifest.name} name is {data.get('name')!r}, expected {expected!r}")
+
+mk = json.loads((repo_root / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+src = mk["plugins"][0]["source"]
+if not (repo_root / src.lstrip("./")).is_dir():
+    errors.append(f"marketplace.json source {src!r} does not resolve to a directory")
+
+for p in list(refs_dir.glob("*.md")) + [skill_md]:
+    for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+        if len(line) > 100 and not line.lstrip().startswith("description:") and "|" not in line:
+            errors.append(f"{p.name}:{i} exceeds 100 characters ({len(line)})")
+
+if errors:
+    for e in errors:
+        print(f"check-skill: {e}", file=sys.stderr)
+    sys.exit(1)
+print(f"check-skill: ok ({len(on_disk)} references, 4 scripts)")
+PY

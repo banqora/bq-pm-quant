@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Run every deterministic test. Offline, no model calls, no third-party dependencies.
+set -uo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+only="${1:-}"
+if [[ "$only" == "-h" || "$only" == "--help" ]]; then
+  echo "Usage: tests/run [name]    # name matches a tests/<name>.test.sh file"
+  exit 0
+fi
+
+failed=0
+declare -a results=()
+
+for f in tests/*.test.sh; do
+  name="$(basename "$f" .test.sh)"
+  [[ -n "$only" && "$name" != "$only" ]] && continue
+  if bash "$f"; then
+    results+=("PASS $name")
+  else
+    results+=("FAIL $name")
+    failed=$((failed + 1))
+  fi
+  echo
+done
+
+if [[ ${#results[@]} -eq 0 ]]; then
+  echo "tests/run: no test file matched '${only}'" >&2
+  exit 2
+fi
+
+printf '%s\n' "${results[@]}"
+if [[ $failed -eq 0 ]]; then
+  echo "all suites passed"
+else
+  echo "$failed suite(s) failed"
+fi
+exit $((failed > 0))

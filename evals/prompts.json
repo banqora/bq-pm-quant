@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "description": "Trigger corpus. should_trigger prompts must load the bq-pm-quant skill; should_not_trigger prompts must not.",
+  "skill": "bq-pm-quant",
+  "should_trigger": [
+    "my strategy has a sharpe of 1.4 over three years of daily data, is that significant",
+    "compute the information ratio of this portfolio against the benchmark",
+    "backtest this momentum signal on the russell 1000",
+    "run a brinson attribution on last quarter",
+    "the covariance matrix is singular, what do i do",
+    "how do i make sure my out of sample test is actually out of sample",
+    "i tested 40 variants and the best one has a t-stat of 2.6",
+    "estimate beta for these holdings against the euro stoxx 50",
+    "what transaction cost assumption should i use for a small cap strategy",
+    "annualise this monthly return series",
+    "my tracking error is 4.6% in one report and 17.5% in another",
+    "should i shrink the sharpe ratios before ranking these managers",
+    "review this backtest script, i did not write it",
+    "the returns look too good, what should i check first",
+    "compute value at risk and expected shortfall for the book",
+    "how many years of track record before this means anything",
+    "purge and embargo for cross validation on overlapping labels",
+    "decompose the portfolio risk by factor",
+    "my quintile spread is not monotonic",
+    "what is the break-even cost for this strategy"
+  ],
+  "should_not_trigger": [
+    "fix the typescript build error in this react component",
+    "what is the capital of portugal",
+    "write a dockerfile for this flask app",
+    "explain how oauth pkce works",
+    "my kubernetes pod is crashlooping",
+    "summarise this email thread",
+    "what is the tax treatment of a bed and breakfast transaction",
+    "draft the legal wording for a side letter",
+    "should i buy nvidia stock right now",
+    "rename this css class across the project"
+  ]
+}

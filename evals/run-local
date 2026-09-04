@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Run trigger and conduct evaluations against a locally signed-in Claude Code subscription.
+
+Live model calls. Not run in CI; this repository stores no API keys. Run it from a trusted local
+checkout with the skill installed, or with --skill-dir pointing at it.
+
+Usage:
+  evals/run-local --check-auth
+  evals/run-local --conduct-only
+  evals/run-local --conduct-only --case no-disclaimer
+  evals/run-local --triggers-only --runs 1
+  evals/run-local --out evals/results-local.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CREDENTIAL_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
+
+
+def clean_env() -> dict:
+    """Strip inherited credentials so the run uses the subscription login, not an API key."""
+    env = dict(os.environ)
+    for key in CREDENTIAL_ENV:
+        env.pop(key, None)
+    return env
+
+
+def run_claude(prompt: str, skill_dir: Path, timeout: int) -> tuple[str, str]:
+    cmd = ["claude", "-p", prompt, "--output-format", "text"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              env=clean_env(), cwd=str(skill_dir))
+    except FileNotFoundError:
+        raise SystemExit("run-local: the 'claude' CLI is not on PATH.")
+    except subprocess.TimeoutExpired:
+        return "", f"timed out after {timeout}s"
+    if proc.returncode != 0:
+        return proc.stdout, f"claude exited {proc.returncode}: {proc.stderr.strip()[:400]}"
+    return proc.stdout, ""
+
+
+def check_auth() -> int:
+    try:
+        proc = subprocess.run(["claude", "auth", "status", "--text"], capture_output=True,
+                              text=True, timeout=60, env=clean_env())
+    except FileNotFoundError:
+        print("run-local: the 'claude' CLI is not on PATH.", file=sys.stderr)
+        return 2
+    print(proc.stdout.strip() or proc.stderr.strip())
+    return proc.returncode
+
+
+def grade_conduct(case: dict, response: str) -> dict:
+    violations, missing = [], []
+    for pattern in case.get("forbidden", []):
+        m = re.search(pattern, response, re.I | re.M)
+        if m:
+            violations.append({"pattern": pattern, "matched": m.group(0)[:160]})
+    for pattern in case.get("required", []):
+        if not re.search(pattern, response, re.I | re.M):
+            missing.append(pattern)
+    return {
+        "id": case["id"],
+        "tempts": case["tempts"],
+        "passed": not violations and not missing,
+        "violations": violations,
+        "missing_required": missing,
+        "response_chars": len(response),
+    }
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="run-local", description=__doc__.split("\n")[0])
+    ap.add_argument("--check-auth", action="store_true")
+    ap.add_argument("--conduct-only", action="store_true")
+    ap.add_argument("--triggers-only", action="store_true")
+    ap.add_argument("--case", help="run a single conduct case by id")
+    ap.add_argument("--runs", type=int, default=1, help="attempts per trigger prompt")
+    ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--skill-dir", type=Path, default=ROOT)
+    ap.add_argument("--out", type=Path)
+    args = ap.parse_args(argv)
+
+    if args.check_auth:
+        return check_auth()
+
+    results = {"started": time.strftime("%Y-%m-%dT%H:%M:%S"), "conduct": [], "triggers": []}
+
+    if not args.triggers_only:
+        cases = json.loads((ROOT / "evals" / "conduct.json").read_text())["cases"]
+        if args.case:
+            cases = [c for c in cases if c["id"] == args.case]
+            if not cases:
+                raise SystemExit(f"run-local: no conduct case with id {args.case!r}")
+        print(f"conduct: {len(cases)} case(s)")
+        for case in cases:
+            response, err = run_claude(case["prompt"], args.skill_dir, args.timeout)
+            if err:
+                graded = {"id": case["id"], "passed": False, "error": err}
+            else:
+                graded = grade_conduct(case, response)
+                graded["response"] = response
+            results["conduct"].append(graded)
+            mark = "ok  " if graded.get("passed") else "FAIL"
+            print(f"  {mark} {case['id']}")
+            if not graded.get("passed"):
+                for v in graded.get("violations", []):
+                    print(f"        forbidden matched: {v['matched']}")
+                for m in graded.get("missing_required", []):
+                    print(f"        required absent:   {m}")
+                if graded.get("error"):
+                    print(f"        {graded['error']}")
+
+    if not args.conduct_only:
+        corpus = json.loads((ROOT / "evals" / "prompts.json").read_text())
+        skill = corpus["skill"]
+        pairs = [(p, True) for p in corpus["should_trigger"]] + \
+                [(p, False) for p in corpus["should_not_trigger"]]
+        print(f"triggers: {len(pairs)} prompt(s) x {args.runs} run(s)")
+        for prompt, expect in pairs:
+            fired = []
+            for _ in range(args.runs):
+                probe = (f"{prompt}\n\n"
+                         f"(Before answering, state on its own first line whether the "
+                         f"'{skill}' skill applies, as exactly SKILL_USED=yes or SKILL_USED=no.)")
+                response, err = run_claude(probe, args.skill_dir, args.timeout)
+                fired.append(bool(re.search(r"SKILL_USED\s*=\s*yes", response, re.I)) if not err
+                             else None)
+            rate = sum(1 for f in fired if f) / max(1, len(fired))
+            ok = (rate >= 0.5) == expect
+            results["triggers"].append({"prompt": prompt, "expected": expect,
+                                        "fire_rate": rate, "passed": ok})
+            print(f"  {'ok  ' if ok else 'FAIL'} [{ 'should' if expect else 'should not'}] "
+                  f"{rate:.0%}  {prompt[:66]}")
+
+    conduct_fail = sum(1 for r in results["conduct"] if not r.get("passed"))
+    trigger_fail = sum(1 for r in results["triggers"] if not r.get("passed"))
+    print(f"\nconduct: {len(results['conduct']) - conduct_fail}/{len(results['conduct'])} passed")
+    print(f"triggers: {len(results['triggers']) - trigger_fail}/{len(results['triggers'])} passed")
+
+    if args.out:
+        args.out.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"written to {args.out}")
+    return 1 if (conduct_fail or trigger_fail) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
