@@ -1,0 +1,55 @@
+# Tooling configuration for the bq-pm-quant repository.
+#
+# This is not an installable package. There is no [project] table and nothing here is published to
+# an index: the deliverable is the skill directory, and the four helper scripts are standalone,
+# executable, and dependency-free. This file exists so the repository is held to the standard the
+# skill itself mandates in references/coding-standards.md ("Treat every line as production"): typed,
+# linted, and gated. A skill that tells a portfolio manager to run mypy and ruff and does not run
+# them on its own reference implementation has no standing to.
+#
+# The helper scripts carry a shebang and no .py extension, because they are executed rather than
+# imported. Neither tool discovers such files on its own, so both are pointed at them explicitly.
+
+[tool.ruff]
+line-length = 100
+# The floor the CI matrix tests, and what references/coding-standards.md documents as
+# requires-python. Python 3.9 reached end of life in October 2025 and mypy can no longer target it.
+target-version = "py311"
+extend-include = [
+    "skills/bq-pm-quant/scripts/pm-audit",
+    "skills/bq-pm-quant/scripts/pm-docs",
+    "skills/bq-pm-quant/scripts/pm-prefs",
+    "skills/bq-pm-quant/scripts/pm-stats",
+    "evals/run-local",
+]
+
+# The formatter is deliberately NOT gated, and this is a scoped, stated exemption rather than a
+# lowered gate: pm-stats and pm-docs use manual column alignment for their report rows and routing
+# tables, which `ruff format` collapses. Reformatting costs ~1600 lines and destroys the alignment
+# that makes those tables reviewable. Revisit if the tables move into data files.
+
+[tool.ruff.lint]
+# PD and NPY from the reference config are omitted: they target pandas and numpy, and these scripts
+# are standard library only. Everything else matches references/coding-standards.md.
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+# The scripts are modules for type-checking purposes even though they are run as scripts; without
+# this, mypy declines to check a file whose name is not a valid module identifier.
+scripts_are_modules = true
+files = [
+    "skills/bq-pm-quant/scripts/pm-audit",
+    "skills/bq-pm-quant/scripts/pm-docs",
+    "skills/bq-pm-quant/scripts/pm-prefs",
+    "skills/bq-pm-quant/scripts/pm-stats",
+    "evals/run-local",
+]
+
+# scipy ships no stubs mypy can resolve in a bare CI image, and it is an optional import guarded by
+# try/except ImportError. Scoped exemption, not a lowered gate: everything else stays --strict.
+[[tool.mypy.overrides]]
+module = ["scipy.*"]
+ignore_missing_imports = true

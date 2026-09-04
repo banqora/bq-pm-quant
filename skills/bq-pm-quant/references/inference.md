@@ -41,14 +41,16 @@ it is annualisation-invariant and directly comparable across frequencies.
 
 Underpowered tests are the norm in this field and are rarely acknowledged.
 
-- To detect a true annualised Sharpe of 0.5 at 5% two-sided with 80% power requires roughly `T ≈
-  (1.96 + 0.84)² / SR_ann² × k / k = (2.80/0.5)² ≈ 31` years of data. State this when a manager
-  asks whether a two-year track record proves anything.
+- To detect a true annualised Sharpe of 0.5 at 5% two-sided with 80% power requires roughly
+  `years ≈ (1.96 + 0.84)² / SR_ann² = (2.80/0.5)² ≈ 31` years of data, which is `31 × k`
+  observations at the series' own frequency. State this when a manager asks whether a two-year
+  track record proves anything.
 - Rule of thumb: years needed `≈ 7.8 / SR_ann²` for 80% power at 5% two-sided.
 - A non-significant result on a short sample is not evidence of no edge. Report the effect size,
   the interval, and the smallest effect the sample could have detected.
-- Report the minimum detectable effect alongside a null result. It converts an uninformative "not
-  significant" into a bound.
+- Report the minimum detectable effect alongside a null result. Inverting the same rule, on `T`
+  observations at `k` per year the minimum detectable annualised Sharpe is `sqrt(7.84 × k / T)`.
+  It converts an uninformative "not significant" into a bound.
 
 ## Bootstrap
 
@@ -136,5 +138,5 @@ trial count.
 H0: mean daily excess return = 0
 estimate 3.62bp | Newey-West SE 1.21bp (L=6) | t = 2.99 | n = 2516 | two-sided p = 0.0028
 trials in family: 18 | Benjamini-Hochberg q=0.10 threshold p = 0.0056 | survives
-minimum detectable ann. Sharpe at 80% power on this sample: 0.56
+minimum detectable ann. Sharpe at 80% power on this sample: 0.89
 ```

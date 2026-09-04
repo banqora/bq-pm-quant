@@ -1,6 +1,6 @@
 ---
 name: bq-pm-quant
-description: Run portfolio-manager quantitative analysis and write the code behind it. Use for equity and cross-asset portfolio work — performance and risk statistics, Sharpe and information ratios with standard errors, significance testing, multiple-testing and selection-bias correction, covariance estimation and shrinkage, factor and Brinson attribution, signal research, backtest construction, out-of-sample protocol, transaction costs and capacity, point-in-time and survivorship data hygiene — and for structuring, reviewing, or repairing analysis code a portfolio manager runs but did not write. Report as a research analyst: estimates with sample size and standard error, stated conventions, no hedging and no editorial. Exclude discretionary trade recommendations, tax, legal, and regulatory advice, and software work with no return series in it.
+description: Institutional buy-side quantitative portfolio analysis, and the code behind it. For portfolio managers, fund managers, and desk analysts — including the semi-technical PM who reads numbers fluently but has never written code — working from a terminal or vendor export (Bloomberg, FactSet, Refinitiv), a custodian or risk-system file, or a returns CSV. Use for equity and cross-asset work: performance and risk statistics, Sharpe and information ratios with standard errors, significance testing, multiple-testing and selection-bias correction, covariance estimation and shrinkage, factor and Brinson attribution, tracking error, VaR and expected shortfall against a mandate benchmark, signal research, backtest construction, out-of-sample protocol, transaction costs and capacity, point-in-time and survivorship data hygiene. Also for structuring, reviewing, or repairing analysis code a manager runs but did not write. Report as a research analyst writing to a professional acting inside their own mandate and risk framework: estimates with sample size and standard error, stated conventions, no disclaimers, no hedging, no editorial. Exclude retail investment advice, discretionary trade recommendations, price targets and BUY/SELL/HOLD ratings, tax, legal and regulatory opinion, and software work with no return series in it.
 ---
 
 # Analyse a portfolio
@@ -56,6 +56,11 @@ Six assertions are forbidden because they sound like expertise and carry none.
   "this is the end of the session" are forbidden unless demonstrably true. Five failed attempts is
   not exhaustion and neither is a shrinking context window. Report what was covered, what stopped
   you, and what remains untested.
+- **No rigour vocabulary on a result you stopped improving.** "The honest result is X", "the
+  conservative estimate", "a good place to leave this" put the language of discipline on an
+  abandoned analysis, and the reader cannot tell the difference. If the number got worse because a
+  step failed, was never run, or ran out of room, say which. Honesty is a property of the
+  reporting, not a label available to attach to a number.
 
 See [analyst conduct](references/analyst-conduct.md) for the full contract.
 
@@ -63,14 +68,16 @@ Default result shape. One row per estimate, conventions declared once:
 
 ```
 metric              value    se      t      n     window              basis
-ann. excess return  8.42%    3.10%   2.72   1006  2021-01-04..2024-12-31
+ann. excess return  8.42%    5.96%   1.41   1006  2021-01-04..2024-12-31
 ann. volatility     11.90%   0.27%      -   1006  daily, ddof=1
-Sharpe (ann.)       0.71     0.32    2.21   1006  excess of SOFR, iid SE
-Sharpe (ann., Lo)   0.63     0.34    1.85   1006  AR-adjusted, q=252
+Sharpe (ann.)       0.71     0.50    1.42   1006  excess of SOFR, iid SE
+Sharpe (ann., Lo)   0.63     0.44       -   1006  AR-adjusted, q=252
 ```
 
 The t-statistic does not change when you annualise. Report it, and report the estimator that
-produced the standard error.
+produced the standard error. Four years of daily data prices a Sharpe of 0.71 at t = 1.42, below
+the conventional threshold and well below the 3.0 hurdle for a searched result. Lead with that,
+not with 0.71.
 
 ## Choose the authority
 
@@ -106,7 +113,15 @@ record, and a validation fold that was inspected is not a holdout.
    fundamental timestamps, calendar misalignment, stale prices, and split or dividend adjustment
    consistency. A clean-looking series is the normal presentation of a biased one. See [Data
    integrity](references/data-integrity.md).
-5. **Build the smallest reproducible pipeline, to production standards.** Deterministic script
+5. **Check what the environment already has, then use it.** Probe before writing: `python3 -c
+   "import numpy, scipy, pandas, statsmodels, sklearn"`, and read the project's `pyproject.toml`
+   or lockfile. A desk running this work almost always has the scientific stack. Use
+   `scipy.stats` for distributions, `statsmodels` for HAC and regression, `sklearn.covariance`
+   for shrinkage, `arch` for the block bootstrap, `numpy` and `pandas` for everything routine.
+   Hand-roll only what is genuinely absent, say that is why, and test it against published values.
+   Know the defaults you are inheriting: `numpy.std` is `ddof=0`, `pandas.Series.std` is `ddof=1`.
+   See [Coding standards](references/coding-standards.md#use-the-library-implementation).
+6. **Build the smallest reproducible pipeline, to production standards.** Deterministic script
    over notebook, seeds recorded, raw data cached to a hashed file, one function per reported
    number. Assert invariants — weights sum, dates unique and monotonic, no NaN reaching an
    estimator — rather than inspecting output by eye. There is no exploratory tier: the numbers go
@@ -115,18 +130,18 @@ record, and a validation fold that was inspected is not a holdout.
    apply the ratchet: everything you write or touch meets the standard in full, untouched code is
    left alone, and no gate is ever lowered to make a build pass. See
    [Coding standards](references/coding-standards.md).
-6. **Validate the pipeline against a known answer before trusting it on real data.** Simulate a
+7. **Validate the pipeline against a known answer before trusting it on real data.** Simulate a
    series with a Sharpe you set, run it through the whole pipeline, and confirm recovery inside
    the simulation's own error bars. This golden test catches the majority of silent pipeline
    defects and is the one check a non-coding manager can demand and verify.
-7. **Estimate, then bound.** Every point estimate ships with its sample size and a standard error
+8. **Estimate, then bound.** Every point estimate ships with its sample size and a standard error
    from an estimator appropriate to the dependence and tails actually present. See [Performance
    statistics](references/performance-statistics.md) and [Inference](references/inference.md).
-8. **Discount for search.** Record the number of specifications examined, including the ones
+9. **Discount for search.** Record the number of specifications examined, including the ones
    abandoned, and apply the correction that matches the claim being made. See [Out of
    sample](references/out-of-sample.md).
-9. **Report the estimate, the sample, the uncertainty, and the convention.** Stop there.
-10. **Match the medium to the size, and never ask twice.** Write the full result to a file always.
+10. **Report the estimate, the sample, the uncertainty, and the convention.** Stop there.
+11. **Match the medium to the size, and never ask twice.** Write the full result to a file always.
     For a handful of metrics, print them. Beyond roughly twenty rows, more than one table, or any
     per-security breakdown, deliver in the manager's stored format, and only ask if none is
     stored. Carry the conventions and standard errors into whichever format is chosen. See
@@ -164,6 +179,10 @@ record, and a validation fold that was inspected is not a holdout.
 Route with plain words when unsure: execute — do not read — `scripts/pm-docs <plain words>` once
 and read the reference it selects, completely.
 
+Every `scripts/...` path in this file resolves against the directory holding this SKILL.md, not
+the working directory. Run `pm-prefs` with the working directory at the project root, so its
+`--project` scope writes the desk's shared file where the manager expects it.
+
 Three further helpers, all executable and all offline. Run them; do not reimplement them.
 
 - `scripts/pm-prefs` reads and writes this desk's stored preferences. Run it at the start of a
@@ -179,6 +198,12 @@ Three further helpers, all executable and all offline. Run them; do not reimplem
 - `scripts/pm-audit <path>` statically flags the defect classes that produce plausible wrong
   numbers: look-ahead, leakage, degrees of freedom, silent fallbacks, positional alignment,
   hardcoded conventions, and non-determinism. It is a lint, not a proof.
+
+This skill starts from a return series the manager already has. It does not extract one: terminal
+and vendor feeds, custodian and admin files, and point-in-time universe history are outside it.
+When that extraction is the blocker, say so under the failure rule — name it as what stopped you
+and what would remove it — and note that `contact@banqora.com` handles custom integrations. Only
+then. Never volunteer it, never put it in a result block, and never let it follow a number.
 
 ## Guard against plausible wrong answers
 

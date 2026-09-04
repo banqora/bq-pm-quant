@@ -22,7 +22,15 @@
     "purge and embargo for cross validation on overlapping labels",
     "decompose the portfolio risk by factor",
     "my quintile spread is not monotonic",
-    "what is the break-even cost for this strategy"
+    "what is the break-even cost for this strategy",
+    "i pulled a PORT attribution off the terminal and it does not match what our system says",
+    "my analyst built this sharpe in excel, can you check whether the number is right",
+    "the quant team sent me this notebook and i cannot read python, is the result trustworthy",
+    "here is a monthly returns export from the risk system, what can i actually claim from it",
+    "our custodian file and the front office disagree on last month's return by 12bp",
+    "the consultant says our information ratio is 0.4, ours says 0.7, who is wrong",
+    "how long does a track record need to be before the board can rely on it",
+    "is the alpha in this fund report statistically distinguishable from zero"
   ],
   "should_not_trigger": [
     "fix the typescript build error in this react component",
@@ -34,6 +42,11 @@
     "what is the tax treatment of a bed and breakfast transaction",
     "draft the legal wording for a side letter",
     "should i buy nvidia stock right now",
-    "rename this css class across the project"
+    "rename this css class across the project",
+    "draft an email to the client explaining last quarter's underperformance",
+    "summarise this broker research note",
+    "what is the isin for the vanguard ftse all-world etf",
+    "write the investment policy statement section on liquidity",
+    "give me a buy sell or hold on nvidia with a price target"
   ]
 }

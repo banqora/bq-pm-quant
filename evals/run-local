@@ -20,7 +20,9 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, TypedDict
 
 ROOT = Path(__file__).resolve().parent.parent
 CREDENTIAL_ENV = (
@@ -30,7 +32,7 @@ CREDENTIAL_ENV = (
 )
 
 
-def clean_env() -> dict:
+def clean_env() -> dict[str, str]:
     """Strip inherited credentials so the run uses the subscription login, not an API key."""
     env = dict(os.environ)
     for key in CREDENTIAL_ENV:
@@ -44,7 +46,7 @@ def run_claude(prompt: str, skill_dir: Path, timeout: int) -> tuple[str, str]:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                               env=clean_env(), cwd=str(skill_dir))
     except FileNotFoundError:
-        raise SystemExit("run-local: the 'claude' CLI is not on PATH.")
+        raise SystemExit("run-local: the 'claude' CLI is not on PATH.") from None
     except subprocess.TimeoutExpired:
         return "", f"timed out after {timeout}s"
     if proc.returncode != 0:
@@ -63,8 +65,35 @@ def check_auth() -> int:
     return proc.returncode
 
 
-def grade_conduct(case: dict, response: str) -> dict:
-    violations, missing = [], []
+class Graded(TypedDict, total=False):
+    """One conduct case's result. `error` is present only when the model call itself failed."""
+
+    id: str
+    tempts: str
+    passed: bool
+    violations: list[dict[str, str]]
+    missing_required: list[str]
+    response_chars: int
+    response: str
+    error: str
+
+
+class TriggerResult(TypedDict):
+    prompt: str
+    expected: bool
+    fire_rate: float
+    passed: bool
+
+
+class Results(TypedDict):
+    started: str
+    conduct: list[Graded]
+    triggers: list[TriggerResult]
+
+
+def grade_conduct(case: dict[str, Any], response: str) -> Graded:
+    violations: list[dict[str, str]] = []
+    missing: list[str] = []
     for pattern in case.get("forbidden", []):
         m = re.search(pattern, response, re.I | re.M)
         if m:
@@ -82,7 +111,7 @@ def grade_conduct(case: dict, response: str) -> dict:
     }
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="run-local", description=__doc__.split("\n")[0])
     ap.add_argument("--check-auth", action="store_true")
     ap.add_argument("--conduct-only", action="store_true")
@@ -97,7 +126,8 @@ def main(argv=None) -> int:
     if args.check_auth:
         return check_auth()
 
-    results = {"started": time.strftime("%Y-%m-%dT%H:%M:%S"), "conduct": [], "triggers": []}
+    results: Results = {"started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "conduct": [], "triggers": []}
 
     if not args.triggers_only:
         cases = json.loads((ROOT / "evals" / "conduct.json").read_text())["cases"]
@@ -108,6 +138,7 @@ def main(argv=None) -> int:
         print(f"conduct: {len(cases)} case(s)")
         for case in cases:
             response, err = run_claude(case["prompt"], args.skill_dir, args.timeout)
+            graded: Graded
             if err:
                 graded = {"id": case["id"], "passed": False, "error": err}
             else:
@@ -131,7 +162,7 @@ def main(argv=None) -> int:
                 [(p, False) for p in corpus["should_not_trigger"]]
         print(f"triggers: {len(pairs)} prompt(s) x {args.runs} run(s)")
         for prompt, expect in pairs:
-            fired = []
+            fired: list[bool | None] = []
             for _ in range(args.runs):
                 probe = (f"{prompt}\n\n"
                          f"(Before answering, state on its own first line whether the "

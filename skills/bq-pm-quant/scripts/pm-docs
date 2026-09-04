@@ -12,38 +12,53 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
-REFS = [
+# (file name, one-line scope, routing keywords). A term may legitimately appear in more than one
+# list: "benchmark" is a convention question, a ratio question, and a risk question.
+Ref = tuple[str, str, list[str]]
+
+REFS: list[Ref] = [
     ("analyst-conduct.md",
      "How to report: disclaimers, refusals, hedging, tone, failure, output format",
      ["disclaimer", "advice", "refuse", "refusal", "decline", "hedge", "hedging", "caveat",
       "editorial", "tone", "opinion", "judgement", "judgment", "phrase", "phrasing", "wording",
       "report", "reporting", "present", "presentation", "format", "csv", "xlsx", "html", "output",
       "deliver", "exhausted", "give up", "gave up", "unable", "failed", "failure", "baseline",
-      "verdict", "good", "bad", "conduct", "voice", "commentary", "null result", "how should i say"]),
+      "verdict", "good", "bad", "conduct", "voice", "commentary", "null result",
+      "how should i say", "spreadsheet", "excel", "workbook", "kelly", "kelly fraction",
+      "position size", "position sizing", "sizing", "position", "optimal weight",
+      "expected return", "how big",
+      "compared to what", "is that good", "is this good", "is that high", "is this high",
+      "how does that compare", "against what", "versus what", "caveats"]),
     ("return-conventions.md",
      "Return construction, compounding, annualisation, risk-free, currency, calendars",
      ["convention", "log return", "simple return", "arithmetic", "geometric", "cagr", "compound",
       "compounding", "annualise", "annualize", "annualisation", "annualization", "252", "periods",
       "frequency", "risk free", "risk-free", "rf", "excess return", "currency", "fx", "hedged",
       "calendar", "holiday", "weekend", "align", "alignment", "resample", "resampling", "ddof",
-      "day count", "daycount", "sofr", "basis", "total return", "price return", "drift"]),
+      "day count", "daycount", "sofr", "basis", "total return", "price return", "drift",
+      "benchmark", "benchmarks", "volatility", "vol", "expected return", "monthly", "daily",
+      "weekly", "quarterly", "square root of time", "sqrt of time", "vol drag"]),
     ("performance-statistics.md",
      "Sharpe, information ratio, Sortino, drawdown, their standard errors, deflation, shrinkage",
      ["sharpe", "information ratio", "sortino", "calmar", "omega", "drawdown", "max dd",
       "standard error", "se", "deflated", "deflation", "probabilistic", "psr", "dsr", "shrink",
       "shrinkage", "james-stein", "stein", "empirical bayes", "track record", "mintrl", "hit rate",
       "capture", "turnover", "break-even", "breakeven", "skew", "kurtosis", "lo adjustment",
-      "autocorrelation adjustment", "ratio", "performance", "statistic", "metric"]),
+      "autocorrelation adjustment", "ratio", "performance", "statistic", "metric", "benchmark",
+      "benchmarks", "volatility", "vol", "active risk", "error bar", "error bars"]),
     ("inference.md",
      "t-tests, HAC standard errors, bootstrap, multiple testing, power, comparing strategies",
      ["t test", "t-test", "ttest", "t stat", "t-stat", "tstat", "p value", "p-value", "pvalue",
       "significant", "significance", "hypothesis", "null", "newey", "west", "hac",
       "heteroskedast", "bootstrap", "block bootstrap", "stationary bootstrap", "multiple testing",
       "bonferroni", "holm", "benjamini", "fdr", "false discovery", "family-wise", "power",
-      "sample size needed", "confidence interval", "regression", "fama-macbeth", "fama macbeth",
-      "overlapping", "compare", "comparing", "difference", "harvey", "hurdle"]),
+      "sample size", "sample size needed", "how many observations", "how much data",
+      "confidence interval", "regression", "fama-macbeth", "fama macbeth",
+      "overlapping", "compare", "comparing", "difference", "harvey", "hurdle", "alpha",
+      "is alpha significant", "standard error of"]),
     ("out-of-sample.md",
      "OOS protocol, walk-forward, purged CV, PBO, reality check, the trial log",
      ["out of sample", "out-of-sample", "oos", "in sample", "in-sample", "holdout", "hold-out",
@@ -51,14 +66,16 @@ REFS = [
       "walk forward", "walk-forward", "purge", "purged", "embargo", "cpcv", "combinatorial",
       "overfit", "overfitting", "pbo", "cscv", "reality check", "white", "spa", "hansen",
       "data snooping", "snooping", "leak", "leakage", "trial", "trials", "search", "pre-register",
-      "preregister", "generalis", "generaliz", "robust"]),
+      "preregister", "generalis", "generaliz", "robust", "trial log", "trial count",
+      "specifications tried", "how many strategies"]),
     ("backtesting.md",
      "Backtest engine, lag discipline, rebalancing, costs, capacity, what a backtest can prove",
      ["backtest", "back-test", "backtesting", "simulate", "simulation", "lag", "shift", "timing",
       "execution", "fill", "rebalance", "rebalancing", "transaction cost", "costs", "slippage",
       "spread", "impact", "market impact", "commission", "borrow", "financing", "leverage",
       "capacity", "adv", "participation", "short", "shorting", "long-short", "gross", "net",
-      "buy and hold", "engine", "pipeline"]),
+      "buy and hold", "engine", "pipeline", "position size", "position sizing", "turnover cost",
+      "break even cost"]),
     ("risk-models.md",
      "Covariance, shrinkage, factor models, beta, tracking error, VaR, expected shortfall",
      ["covariance", "correlation matrix", "cov", "ledoit", "wolf", "oas", "denoise", "marchenko",
@@ -66,12 +83,18 @@ REFS = [
       "eigenvalue", "factor model", "beta", "blume", "vasicek", "dimson", "tracking error", "te",
       "ex-ante", "ex ante", "ex-post", "var", "value at risk", "cvar", "expected shortfall", "es",
       "tail", "garch", "ewma", "dcc", "optimiser", "optimizer", "optimisation", "optimization",
-      "mean variance", "mean-variance", "risk parity", "hrp", "weights", "kupiec", "risk model"]),
+      "mean variance", "mean-variance", "risk parity", "hrp", "weights", "kupiec", "risk model",
+      "benchmark", "benchmarks", "volatility", "vol", "correlation", "alpha", "active risk",
+      "residual risk", "exposure", "exposures"]),
     ("attribution.md",
      "Brinson, factor attribution, multi-period linking, currency attribution, reconciliation",
      ["attribution", "attribute", "brinson", "fachler", "hood", "beebower", "allocation effect",
-      "selection effect", "interaction", "linking", "carino", "menchero", "grap", "geometric attribution", "contribution", "decompose", "decomposition", "active return", "segment",
-      "sector attribution", "reconcile", "reconciliation", "marginal contribution", "risk contribution"]),
+      "selection effect", "interaction", "linking", "carino", "menchero", "grap",
+      "geometric attribution", "contribution", "decompose", "decomposition",
+      "active return", "segment",
+      "sector attribution", "reconcile", "reconciliation", "marginal contribution",
+      "risk contribution", "alpha", "benchmark", "benchmarks", "excess over benchmark",
+      "where did the return come from", "what drove"]),
     ("equity-desk.md",
      "Universe, classification, corporate actions, borrow, liquidity, cross-sectional signals",
      ["universe", "index membership", "constituent", "gics", "icb", "classification", "sector",
@@ -79,38 +102,56 @@ REFS = [
       "dividend", "spin-off", "spinoff", "rights issue", "merger", "acquisition", "ticker",
       "borrow", "hard to borrow", "htb", "liquidity", "volume", "quintile", "decile", "signal",
       "information coefficient", "ic", "neutralise", "neutralize", "winsorise", "winsorize",
-      "z-score", "zscore", "rank", "decay", "earnings", "equity", "stock", "screen"]),
+      "z-score", "zscore", "rank", "decay", "earnings", "equity", "stock", "screen", "monotonic",
+      "monotonicity", "cross-section", "cross section"]),
     ("data-integrity.md",
      "Survivorship, look-ahead, vintage, corporate actions, stale prices, alignment, fabrication",
-     ["survivorship", "survivor", "delisting", "delisted", "look ahead", "look-ahead", "lookahead",
+     ["survivorship", "survivorship bias", "survivor", "delisting", "delisted",
+      "look ahead", "look-ahead", "lookahead",
       "point in time", "point-in-time", "pit", "as of", "as-of", "restate", "restatement",
       "vintage", "snapshot", "stale", "forward fill", "forward-fill", "ffill", "missing", "nan",
       "null", "zero", "gap", "outlier", "extreme", "jump", "clean", "cleaning", "hygiene",
       "quality", "integrity", "placeholder", "hardcoded", "fabricated", "suspicious", "uniform",
-      "pence", "gbx", "minor unit", "timezone", "time zone", "data"]),
+      "pence", "gbx", "minor unit", "timezone", "time zone", "data", "monotonic", "duplicate",
+      "duplicated", "duplicate dates"]),
     ("coding-standards.md",
-     "Project layout, config, assertions, golden test, determinism, reviewing code you did not write",
+     "Project layout, config, assertions, golden test, determinism, reviewing code you "
+     "did not write",
      ["code", "coding", "script", "notebook", "jupyter", "layout", "structure", "config",
       "configuration", "constant", "assert", "assertion", "test", "testing", "golden", "unit test",
       "noise test", "seed", "random", "determinism", "deterministic", "reproducib", "cache",
-      "caching", "hash", "version", "git", "refactor", "review code", "read the code", "best practice", "best practise", "standards", "raise", "exception", "fallback", "canonical"]),
+      "caching", "hash", "version", "git", "refactor", "review code", "read the code",
+      "best practice", "best practise", "standards", "raise", "exception", "fallback",
+      "canonical"]),
     ("review-checklist.md",
      "What to demand before a number is used, and how to diagnose a surprising one",
      ["checklist", "review", "check", "trust", "before i use", "can i trust", "sanity", "audit",
-      "diagnose", "diagnosis", "surprising", "implausible", "too good", "too high", "too low",
-      "wrong", "suspicious number", "escalate", "sign off", "sign-off", "verify", "verification"]),
+      "diagnose", "diagnosis", "diagnostic", "surprising", "implausible", "too good", "too high",
+      "too low", "wrong", "suspicious", "suspicious number", "looks suspicious", "escalate",
+      "sign off", "sign-off", "verify", "verification", "seems wrong", "looks wrong",
+      "look wrong", "went wrong", "seems too", "looks too", "too good to be true",
+      "sanity check", "sense check", "spot check", "double check", "what should i check",
+      "should i check", "red flag", "red flags", "plausible", "believable", "unrealistic",
+      "unbelievable", "hard to believe", "make sense", "makes sense", "look right",
+      "looks right", "before using", "troubleshoot", "what now"]),
 ]
 
-STOPWORDS = {"the", "a", "an", "is", "are", "do", "does", "how", "what", "why", "when", "should",
-             "i", "we", "my", "our", "to", "of", "for", "in", "on", "and", "or", "it", "this",
-             "that", "with", "can", "be", "use", "using", "get", "make", "need"}
+STOPWORDS: set[str] = {
+    "the", "a", "an", "is", "are", "do", "does", "how", "what", "why", "when", "should",
+    "i", "we", "my", "our", "to", "of", "for", "in", "on", "and", "or", "it", "this",
+    "that", "with", "can", "be", "use", "using", "get", "make", "need"}
+
+# One routing entry per reference, which is what check-skill enforces from the outside. A
+# duplicate would silently make the second entry unreachable in a tie.
+if len({name for name, _scope, _keywords in REFS}) != len(REFS):
+    raise RuntimeError("duplicate entry in REFS: the second would be unreachable in a tie")
 
 
-def score(query: str, keywords, scope: str):
+def score(query: str, keywords: Sequence[str], scope: str) -> tuple[float, list[str]]:
     q = " " + re.sub(r"[^a-z0-9 -]", " ", query.lower()) + " "
     q = re.sub(r"\s+", " ", q)
     total = 0.0
-    hits = []
+    hits: list[str] = []
     for kw in keywords:
         k = kw.strip().lower()
         if not k:
@@ -130,38 +171,42 @@ def score(query: str, keywords, scope: str):
     return total, hits
 
 
-def main(argv):
+def main(argv: Sequence[str]) -> int:
     root = Path(__file__).resolve().parent.parent / "references"
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
     if argv[0] == "--list":
-        for name, scope, _ in REFS:
+        for name, scope, _keywords in REFS:
             print(f"{'references/' + name:<38}{scope}")
         return 0
 
     query = " ".join(argv)
-    ranked = []
-    for name, scope, kws in REFS:
-        sc, hits = score(query, kws, scope)
+    ranked: list[tuple[float, str, str, list[str]]] = []
+    for name, scope, keywords in REFS:
+        sc, hits = score(query, keywords, scope)
         ranked.append((sc, name, scope, hits))
     ranked.sort(key=lambda x: -x[0])
 
     if ranked[0][0] == 0:
         print(f"pm-docs: no confident match for {query!r}.")
         print("Start with the SKILL.md decision path, or list the references:\n")
-        for name, scope, _ in REFS:
+        for name, scope, _keywords in REFS:
             print(f"  {'references/' + name:<38}{scope}")
         return 1
 
     sc, name, scope, hits = ranked[0]
-    print(f"{root / name}")
+    selected = root / name
+    if not selected.is_file():
+        sys.stderr.write(f"pm-docs: {selected} is missing; the routing table and the references "
+                         "directory disagree\n")
+    print(f"{selected}")
     print(f"  scope: {scope}")
     print(f"  matched: {', '.join(hits[:6]) if hits else 'scope terms'}")
     runners = [r for r in ranked[1:3] if r[0] >= sc * 0.6 and r[0] > 0]
     if runners:
         print("  also relevant:")
-        for rsc, rname, rscope, _ in runners:
+        for _rsc, rname, rscope, _rhits in runners:
             print(f"    references/{rname:<32}{rscope}")
     print("\nRead the selected reference completely before acting.")
     return 0

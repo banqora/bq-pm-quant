@@ -2,7 +2,8 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # This repo's default branch is master; [main] alone meant the push trigger never fired.
+    branches: [main, master]
   pull_request:
 
 permissions:
@@ -14,7 +15,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.13"]
+        # 3.11 is the floor: it is what references/coding-standards.md documents as
+        # requires-python, and 3.9 reached end of life in October 2025.
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,6 +27,22 @@ jobs:
         run: scripts/check-skill --static
       - name: Run the test suite
         run: tests/run
+
+  quality:
+    # The gates the skill itself mandates in references/coding-standards.md and that pm-audit
+    # tells its users to run. Versions are pinned, per that file's own instruction.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install pinned tools
+        run: pip install ruff==0.14.4 mypy==2.3.1
+      - name: Lint
+        run: ruff check .
+      - name: Type check
+        run: mypy
 
   shellcheck:
     runs-on: ubuntu-latest

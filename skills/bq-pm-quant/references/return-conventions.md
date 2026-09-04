@@ -62,10 +62,12 @@ frequency, a rate, or a calendar.
 ## Risk-free and excess returns
 
 - Subtract the risk-free rate **at the series' own frequency**, on the series' own dates.
-- Convert an annualised quoted rate to a period rate consistently. For a rate `y` quoted act/360
-  money-market simple, the period rate over `d` calendar days is `y × d/360`. For an annually
-  compounded rate the period rate is `(1+y)^(1/k) - 1`. Choose one and record it; dividing an
-  annual rate by 252 is an approximation that leaves a persistent small bias.
+- Convert an annualised quoted rate `y` to a period rate consistently. `risk_free_daycount` takes
+  one of four values: `act/360` and `act/365` give the rate over `d` calendar days as `y × d/360`
+  and `y × d/365`; `compounded` gives `(1+y)^(1/k) - 1`; `simple-annual` gives `y/k`. Choose one
+  and record it. `simple-annual` is the divide-by-252 approximation: it ignores the actual calendar
+  gap between observations and leaves a persistent small bias, so use it only where the quoted
+  rate's day count is unknown.
 - Use the tenor that matches the rebalance horizon. Overnight rates (SOFR, ESTR, SONIA) for a
   daily series; 1M or 3M bills for monthly series if the mandate specifies.
 - Excess return over a **benchmark** is a different quantity from excess return over the

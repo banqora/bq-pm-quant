@@ -39,6 +39,7 @@ its size.
 | Cumulative return does not match the periodic returns | Arithmetic summation instead of compounding | Recompute as a product; compare |
 | Two tracking errors differ by a large factor | Rebalancing assumption, not the estimator | Hold everything fixed and switch only the drift treatment |
 | Metrics suspiciously uniform across securities | Placeholder function returning a constant | Reverse-engineer the value back to the constant that produces it |
+| A report's identifiers do not match its content | Retargeted template or generated text; not a statistical defect | Count entity mentions per document; check whether any single fact appears twice with two values |
 | Portfolio return does not match the sum of contributions | Weight convention; missing cash; a dropped position | Reconcile weights, confirm they sum to the declared exposure |
 | Optimiser weights extreme or unstable | Unshrunk covariance; error maximisation | Report the condition number; re-run with shrinkage and compare |
 | Result changed with no code change | Vendor restatement | Compare against the cached snapshot and its hash |

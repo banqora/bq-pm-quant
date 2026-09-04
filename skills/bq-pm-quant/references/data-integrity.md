@@ -70,6 +70,10 @@ the same historical date, without any code change.
 - Diagnostic: scan every series for single-day absolute returns above a threshold (50% is a common
   choice) and inspect each hit individually against the corporate-action record. Do not
   auto-correct. A genuine 50% move exists and deleting it is also a defect.
+- The three thresholds in this skill are tiers, not disagreements: flag and inspect above 50%,
+  raise above 100% (see [coding standards](coding-standards.md#assertions-on-invariants)), and
+  refuse to compute above 150%, where the series is percent-scaled rather than decimal far more
+  often than it is genuine.
 - Special dividends, spin-offs, rights issues, and share consolidations each break a naive price
   series differently. Check the action type before deciding the treatment.
 - Diagnostic for consistency: for a name with a known split, confirm the share count and the price
@@ -102,8 +106,8 @@ than it is on every risk statistic simultaneously.
   stale-price flag, not a quiet market.
 - Do not silently forward-fill. Decide per security whether to fill, to drop, or to exclude the
   name, and record which and why.
-- For beta on stale-priced assets, use the Dimson correction: sum the coefficients on
-  contemporaneous and lagged market returns.
+- For beta on stale-priced assets, use the Dimson correction; see [risk
+  models](risk-models.md#beta).
 - Never synthesise price history for a security with insufficient data and then compute statistics
   on the combined series without marking which observations are synthetic. If a model-generated
   backfill is used, propagate a flag and exclude those observations from any reported statistic,
@@ -175,6 +179,29 @@ Related patterns to grep for in any inherited analysis code: a hardcoded correla
 derived as a fixed multiple of another volatility, an expected shortfall computed as a fixed
 multiple of value-at-risk, and any comment containing "placeholder", "mock", "TODO", or
 "approximate".
+
+### When the identifiers and the content disagree
+
+A second signature, and the one most likely to survive review because the prose reads well: a
+report headed with one identifier whose body describes a different one. A factsheet titled with
+one ticker that discusses another company's business, a table labelled with one window whose
+figures come from another, a stated benchmark that is not the one the active numbers were computed
+against. Retargeted templates and generated text both produce this, and no statistical check will
+catch it — the arithmetic is internally fine, it is simply about something else.
+
+Two cheap tests, both worth running on any document you did not compute yourself.
+
+- **Count the entity references.** If the identifier in the header appears once and a different one
+  appears throughout the body, the document was retargeted and not rewritten.
+- **Look for one fact stated twice with two values.** An insider-selling total given as one figure
+  in the risk section and a different figure two paragraphs later; a price or level quoted as a
+  percentage move that does not reconcile with the absolute figure given elsewhere; a return and a
+  volatility that do not produce the stated ratio. A document assembled rather than computed
+  usually disagrees with itself somewhere, and that disagreement is easier to find than the
+  original error.
+
+Neither test needs the underlying data, which is what makes them the first two to run on an
+inherited report.
 
 ## Minimum observation gates
 

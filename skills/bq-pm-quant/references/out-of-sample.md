@@ -31,6 +31,15 @@ Rank any claim by which of these it actually meets. State the level explicitly.
 
 Most work described as out-of-sample is level 1. Say so.
 
+**A live record is not a backtest and must not be corrected like one.** Deflation, shrinkage and
+trial-count haircuts discount a search the analyst performed over history. A book run forward from
+a fixed date carries no such search: the manager could not have selected those months on results
+that had not happened yet. Applying a backtest correction to live performance discounts a bias
+that is not present, and it is the most common way a genuine track record is talked down. Where a
+record is part simulated and part live, correct the simulated segment, report the live segment
+uncorrected, and give `n` and the window for each separately. Never blend them into one
+corrected figure.
+
 ## The holdout is a single-use resource
 
 Once a holdout has been evaluated and the result influenced any subsequent decision, it is

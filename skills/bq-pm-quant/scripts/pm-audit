@@ -8,6 +8,9 @@ This is a lint, not a proof. It reports candidates for inspection; a finding is 
 have looked at it, and a clean run is not evidence of correctness. Nothing here replaces the
 golden test and the noise test.
 
+Accepts .py files, .ipynb notebooks, and extension-less executables with a python shebang, so a
+runnable pipeline script is audited rather than silently skipped.
+
 Usage:
   pm-audit <path> [<path> ...]        files or directories
   pm-audit <path> --severity high     only high-severity findings
@@ -18,14 +21,51 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+from typing import TypedDict
 
 HIGH, MED, LOW = "high", "medium", "low"
 
+
+class Finding(TypedDict):
+    """One candidate defect, located in a file."""
+
+    file: str
+    line: int
+    id: str
+    severity: str
+    message: str
+    source: str
+
+
+class Problem(TypedDict):
+    """A path that was not audited, and whether that is an error or a deliberate skip."""
+
+    path: str
+    reason: str
+    error: bool
+
+
+# A span of columns on one line that holds string-literal text rather than code.
+Spans = dict[int, list[tuple[int, int]]]
+
+FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+
+EOL = 1 << 30
+
+PLACEHOLDER_WORDS = r"\b(placeholder|mock|dummy|fake|for now|hardcod|TODO|FIXME|XXX)\b"
+
+# Rules whose subject is prose. They still fire inside comments and string literals; every other
+# line rule is suppressed there, because a usage string that mentions 252 is not a hardcoded
+# convention and a docstring that says "return 0" is not a fabricated estimate.
+PROSE_RULES = {"PLACEHOLDER"}
+
 # (id, severity, regex, message) — regex checks run per line.
-LINE_RULES = [
+LINE_RULES: list[tuple[str, str, str, str]] = [
     ("LOOKAHEAD-SHIFT-NEG", HIGH, r"\.shift\(\s*-\s*\d+",
      "negative shift moves future data into the present; a forward return must be built by "
      "shifting the return backwards relative to the signal, not the signal forwards"),
@@ -47,23 +87,23 @@ LINE_RULES = [
     ("SILENT-FALLBACK", HIGH, r"except\s*(Exception|BaseException)?\s*(as\s+\w+)?\s*:",
      "broad exception handling turns a failure into a number; a computation that cannot be "
      "performed correctly must raise"),
-    ("SILENT-ZERO", HIGH, r"(return\s+0(\.0)?\s*$|\.fillna\(\s*0(\.0)?\s*\))",
-     "returning or filling zero for a failed or missing estimate makes an unknown "
-     "indistinguishable from a measurement; return None and let the caller handle it"),
+    ("SILENT-ZERO", HIGH, r"\.fillna\(\s*0(\.0)?\s*\)",
+     "filling zero for a missing observation makes an unknown indistinguishable from a "
+     "measurement; zero is not missing and missing is not zero"),
     ("ALIGN-POSITIONAL", HIGH, r"\.iloc\[\s*:\s*min_?len|\.iloc\[\s*:\s*min\(",
      "positional truncation pairs one series' dates against another's; align on the date index "
      "and assert the indices are equal"),
     ("ALIGN-VALUES", MED, r"\.values\b.*\.values\b",
      "operating on two .values arrays discards the index; alignment is no longer checked"),
     ("HARDCODE-PERIODS", MED,
-     r"(?<![\w.])(252|260|365)(?![\w.])|sqrt\(\s*12\s*\)|(?<![\w.])/\s*12(?![\w.])",
+     r"(?<![\w.])(252|260|365)(?![\w.])|sqrt\(\s*12\s*\)|/\s*12(?![\w.])",
      "a periods-per-year literal outside the config; centralise it so every statistic agrees"),
     ("HARDCODE-RF", MED, r"risk_free\w*\s*=\s*0\.\d+",
      "a hardcoded risk-free rate; take it from the config and record the instrument and day count"),
     ("HARDCODE-COST", MED, r"(bps|basis_points|cost)\w*\s*=\s*\d+(\.\d+)?",
      "a hardcoded cost assumption; duplicate cost defaults in different modules produce "
      "irreconcilable net returns"),
-    ("PLACEHOLDER", HIGH, r"#.*\b(placeholder|mock|dummy|fake|for now|hardcod|TODO|FIXME|XXX)\b",
+    ("PLACEHOLDER", HIGH, r"#.*" + PLACEHOLDER_WORDS,
      "a placeholder implementation that returns a plausible constant is indistinguishable from a "
      "measurement once it reaches a report"),
     ("SEED-GLOBAL", MED, r"np\.random\.seed\(|numpy\.random\.seed\(",
@@ -75,7 +115,10 @@ LINE_RULES = [
     ("DROPNA-BLIND", MED, r"\.dropna\(\s*\)",
      "an unqualified dropna silently changes the sample and therefore every annualisation; state "
      "the axis and how, and report the count removed"),
-    ("SUM-RETURNS", HIGH, r"\b(returns?|rets?|r|pnl|active)\s*\.\s*sum\(\)",
+    # The identifier must *end* in the target word, so portfolio_returns.sum() is caught, and must
+    # not contain "log", because summing log returns is the correct way to compound them.
+    ("SUM-RETURNS", HIGH,
+     r"(?<!\w)(?!\w*log)(?:\w*_)?(?:returns?|rets?|r|pnl|active)\s*\.\s*sum\(\s*\)",
      "summing simple returns is not compounding; cumulative return is the product of (1 + r)"),
     ("CORR-NAN-ZERO", HIGH, r"nan_to_num\(",
      "replacing NaN with zero in a correlation or covariance matrix asserts independence where "
@@ -92,10 +135,20 @@ AST_NOTES = {
     "bare_except": (HIGH, "a bare except swallows every failure including a keyboard interrupt"),
     "except_pass": (HIGH, "an exception handler whose body is pass or continue discards a failure "
                           "with no record that it happened"),
+    "except_probe": (LOW, "an exception handler that catches one specific error and continues the "
+                          "loop is the format-probe idiom; confirm the loop's exhaustion path "
+                          "records the failure rather than returning a default"),
     "except_default": (HIGH, "an exception handler that returns a constant substitutes a "
                              "fabricated value for a failed computation"),
-    "no_assert": (LOW, "no assertions in this file; alignment, weight-sum, and lag invariants are "
-                       "the cheapest defence against a plausible wrong number"),
+    "zero_on_failure": (HIGH, "zero returned on a failure or insufficient-data path makes an "
+                              "unknown indistinguishable from a measurement; return None and let "
+                              "the caller handle it"),
+    "zero_literal": (LOW, "a literal zero returned from a computation; confirm zero is the "
+                          "measured answer here and not a stand-in for a value that was not "
+                          "available"),
+    "no_invariant_check": (LOW, "no invariant check in this file; alignment, weight-sum and lag "
+                                "invariants are the cheapest defence against a plausible wrong "
+                                "number. State them as raises, not asserts: -O strips asserts"),
     "untyped": (MED, "public function without complete type annotations; a series of prices and a "
                      "series of returns are the same type to the interpreter and different things "
                      "to the analysis, and annotations are where that gets written down"),
@@ -103,31 +156,149 @@ AST_NOTES = {
                          "boundary it is meant to guard"),
 }
 
+# A guard whose condition talks about how much data there is, rather than about the value of a
+# quantity. Returning zero from one of these is the shape a fabricated estimate actually takes.
+INSUFFICIENCY_TEST = re.compile(
+    r"\blen\s*\(|\.empty\b|\bempty\b|\bis\s+None\b|\bisna\b|\bisnull\b|\bisnan\b|\bnan\b|"
+    r"\bnot\s|\bcount\b|\bsize\b|\bshape\b|\bn_?obs\b|\bmin_?obs\w*|\bmin_?periods\b|"
+    r"\bmissing\b|\bvalid\w*|\bnone\b|\bn\b", re.I)
 
-def audit_source(path: Path, text: str):
-    findings = []
-    lines = text.splitlines()
-    for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if stripped.startswith("#") and not re.search(
-                r"\b(placeholder|mock|dummy|fake|for now|hardcod|TODO|FIXME|XXX)\b",
-                stripped, re.I):
+# Names whose "return 0" is a process exit code, not an estimate.
+EXIT_CODE_NAMES = {"main", "_main", "cli", "_cli", "run_cli", "entrypoint"}
+
+SKIP_DIRS = {".venv", "venv", "site-packages", "__pycache__", ".git", "node_modules",
+             "build", "dist"}
+
+PYTHON_SHEBANG = re.compile(rb"^#!.*\bpython[0-9.]*\b")
+
+
+# --------------------------------------------------------------------------- string masking
+
+
+def string_spans(tree: ast.AST) -> Spans:
+    """Column ranges, per line, that are covered by a string literal or docstring.
+
+    Only the literal parts of an f-string are covered on interpreters that report accurate
+    positions for them; on older ones the whole f-string is covered, which is the safe direction.
+    """
+    spans: Spans = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
-        for rid, sev, pattern, msg in LINE_RULES:
-            if re.search(pattern, line, re.I):
-                findings.append({"file": str(path), "line": i, "id": rid, "severity": sev,
-                                 "message": msg, "source": stripped[:160]})
+        end_lineno = node.end_lineno if node.end_lineno is not None else node.lineno
+        end_col = node.end_col_offset if node.end_col_offset is not None else EOL
+        for line in range(node.lineno, end_lineno + 1):
+            start = node.col_offset if line == node.lineno else 0
+            stop = end_col if line == end_lineno else EOL
+            spans.setdefault(line, []).append((start, stop))
+    return spans
+
+
+def inside_string(spans: Spans, line: int, start: int, end: int) -> bool:
+    """True when the column range [start, end) sits entirely inside a string literal."""
+    return any(a <= start and end <= b for a, b in spans.get(line, ()))
+
+
+# --------------------------------------------------------------------------- AST helpers
+
+
+def parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    return parents
+
+
+def ancestors_within_function(
+    node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> tuple[list[ast.AST], FunctionNode | None]:
+    """Every enclosing node up to and including the nearest function, and that function."""
+    chain: list[ast.AST] = []
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return chain, current
+        chain.append(current)
+        current = parents.get(current)
+    return chain, None
+
+
+def returns_literal_zero(node: ast.Return) -> bool:
+    value = node.value
+    if not isinstance(value, ast.Constant):
+        return False
+    constant = value.value
+    if isinstance(constant, bool):
+        return False
+    return isinstance(constant, (int, float)) and constant == 0
+
+
+def is_exit_code_function(func: FunctionNode) -> bool:
+    """True when this function's integer returns are process exit codes rather than estimates."""
+    if func.name in EXIT_CODE_NAMES:
+        return True
+    values: list[int] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Return):
+            continue
+        if not isinstance(node.value, ast.Constant):
+            return False
+        constant = node.value.value
+        if isinstance(constant, bool) or not isinstance(constant, int):
+            return False
+        values.append(constant)
+    return bool(values) and set(values) <= {0, 1, 2} and any(v != 0 for v in values)
+
+
+def is_specific_exception(handler: ast.ExceptHandler) -> bool:
+    """True when the handler names a concrete error class rather than catching everything."""
+    if handler.type is None:
+        return False
+    return not re.search(r"\b(Exception|BaseException)\b", ast.unparse(handler.type))
+
+
+# --------------------------------------------------------------------------- the audit
+
+
+def audit_source(path: Path, text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    lines = text.splitlines()
+
+    tree: ast.Module | None
     try:
         tree = ast.parse(text)
     except SyntaxError as exc:
+        tree = None
         findings.append({"file": str(path), "line": exc.lineno or 0, "id": "PARSE-ERROR",
                          "severity": LOW, "message": f"could not parse: {exc.msg}", "source": ""})
+
+    # A file that does not parse gets no string masking; scanning everything is the safe fallback.
+    spans: Spans = string_spans(tree) if tree is not None else {}
+
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+        comment_line = stripped.startswith("#")
+        for rid, sev, pattern, msg in LINE_RULES:
+            if comment_line and rid not in PROSE_RULES:
+                continue
+            for match in re.finditer(pattern, line, re.I):
+                if rid not in PROSE_RULES and inside_string(spans, i, match.start(), match.end()):
+                    continue
+                findings.append({"file": str(path), "line": i, "id": rid, "severity": sev,
+                                 "message": msg, "source": stripped[:160]})
+                break
+
+    if tree is None:
         return findings
 
-    has_assert = False
+    parents = parent_map(tree)
+    has_invariant_check = False
+    # Return lines already reported by EXCEPT-DEFAULT, which names the value itself.
+    covered_zero_returns: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assert):
-            has_assert = True
+        if isinstance(node, (ast.Assert, ast.Raise)):
+            has_invariant_check = True
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 and not node.name.startswith("_"):
             args = [a for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs
@@ -139,14 +310,18 @@ def audit_source(path: Path, text: str):
                 findings.append({"file": str(path), "line": node.lineno, "id": "TYPE-MISSING",
                                  "severity": sev, "message": f"{msg} ({node.name}: {what})",
                                  "source": ""})
-            for a in args + ([node] if node.returns else []):
-                ann = a.annotation if isinstance(a, ast.arg) else a.returns
+            annotated: list[ast.expr] = [a.annotation for a in args if a.annotation is not None]
+            if node.returns is not None:
+                annotated.append(node.returns)
+            for ann in annotated:
                 if isinstance(ann, ast.Name) and ann.id == "Any":
                     sev, msg = AST_NOTES["untyped_any"]
                     findings.append({"file": str(path), "line": node.lineno, "id": "TYPE-ANY",
                                      "severity": sev, "message": f"{msg} ({node.name})",
                                      "source": ""})
                     break
+        if isinstance(node, ast.Return) and returns_literal_zero(node):
+            findings.extend(zero_return_findings(path, node, parents))
         if isinstance(node, ast.ExceptHandler):
             if node.type is None:
                 sev, msg = AST_NOTES["bare_except"]
@@ -154,55 +329,158 @@ def audit_source(path: Path, text: str):
                                  "severity": sev, "message": msg, "source": ""})
             body = node.body
             if len(body) == 1 and isinstance(body[0], (ast.Pass, ast.Continue)):
-                sev, msg = AST_NOTES["except_pass"]
+                # `continue` under a named error is the format-probe idiom: it tries the next
+                # candidate rather than discarding the only attempt. `pass`, and any broad catch,
+                # still discards a failure with no record.
+                probe = isinstance(body[0], ast.Continue) and is_specific_exception(node)
+                sev, msg = AST_NOTES["except_probe" if probe else "except_pass"]
                 findings.append({"file": str(path), "line": node.lineno, "id": "EXCEPT-PASS",
                                  "severity": sev, "message": msg, "source": ""})
             if len(body) == 1 and isinstance(body[0], ast.Return) and \
                     isinstance(body[0].value, ast.Constant):
                 sev, msg = AST_NOTES["except_default"]
                 val = body[0].value.value
+                covered_zero_returns.add(body[0].lineno)
                 findings.append({"file": str(path), "line": node.lineno, "id": "EXCEPT-DEFAULT",
                                  "severity": sev, "message": f"{msg} (returns {val!r})",
                                  "source": ""})
-    if not has_assert and len(lines) > 40:
-        sev, msg = AST_NOTES["no_assert"]
-        findings.append({"file": str(path), "line": 0, "id": "NO-ASSERT", "severity": sev,
+    # SILENT-FALLBACK is the generic "this handler is broad" signal. Where an AST rule has already
+    # named what the handler actually does with the failure, the generic one adds no information
+    # and double-counts a single defect in the triage totals. Keep the specific finding.
+    specific_handler_lines = {f["line"] for f in findings
+                              if f["id"] in ("EXCEPT-BARE", "EXCEPT-PASS", "EXCEPT-DEFAULT",
+                                             "EXCEPT-PROBE")}
+    findings = [f for f in findings
+                if not (f["id"] == "SILENT-FALLBACK" and f["line"] in specific_handler_lines)
+                and not (f["id"] == "SILENT-ZERO" and f["line"] in covered_zero_returns)]
+
+    if not has_invariant_check and len(lines) > 40:
+        sev, msg = AST_NOTES["no_invariant_check"]
+        findings.append({"file": str(path), "line": 0, "id": "NO-INVARIANT-CHECK", "severity": sev,
                          "message": msg, "source": ""})
     return findings
 
 
-def collect(paths):
-    files = []
-    for p in paths:
-        path = Path(p)
+def zero_return_findings(
+    path: Path, node: ast.Return, parents: dict[ast.AST, ast.AST]
+) -> list[Finding]:
+    """Grade a `return 0`: high on a failure path, low elsewhere, silent for an exit code."""
+    chain, func = ancestors_within_function(node, parents)
+    if func is None or is_exit_code_function(func):
+        return []
+    on_failure_path = False
+    for ancestor in chain:
+        if isinstance(ancestor, ast.ExceptHandler):
+            on_failure_path = True
+            break
+        if isinstance(ancestor, ast.If) and INSUFFICIENCY_TEST.search(ast.unparse(ancestor.test)):
+            on_failure_path = True
+            break
+    sev, msg = AST_NOTES["zero_on_failure" if on_failure_path else "zero_literal"]
+    return [{"file": str(path), "line": node.lineno, "id": "SILENT-ZERO", "severity": sev,
+             "message": f"{msg} ({func.name})", "source": ""}]
+
+
+# --------------------------------------------------------------------------- input handling
+
+
+def has_python_shebang(path: Path) -> bool:
+    """Cheap Python detection for an extension-less file: read the first line only.
+
+    Propagates OSError so an unreadable file is reported rather than treated as not-Python.
+    """
+    with path.open("rb") as handle:
+        first = handle.readline(256)
+    return bool(PYTHON_SHEBANG.match(first))
+
+
+def looks_like_python(path: Path) -> bool:
+    return path.suffix in (".py", ".ipynb") or has_python_shebang(path)
+
+
+def collect(paths: Sequence[str]) -> tuple[list[Path], list[Problem]]:
+    """Resolve the command line into files to audit and paths that were not audited."""
+    files: list[Path] = []
+    problems: list[Problem] = []
+    for raw in paths:
+        path = Path(raw)
         if path.is_dir():
-            files.extend(sorted(
-                f for f in path.rglob("*.py")
-                if not any(part in {".venv", "venv", "site-packages", "__pycache__", ".git",
-                                    "node_modules", "build", "dist"} for part in f.parts)))
-        elif path.suffix == ".py":
-            files.append(path)
-        elif path.suffix == ".ipynb":
+            for found in sorted(path.rglob("*")):
+                if any(part in SKIP_DIRS for part in found.parts) or not found.is_file():
+                    continue
+                if found.suffix in (".py", ".ipynb"):
+                    files.append(found)
+                    continue
+                if found.suffix or not os.access(found, os.X_OK):
+                    continue
+                try:
+                    if has_python_shebang(found):
+                        files.append(found)
+                except OSError as exc:
+                    problems.append({"path": str(found), "reason": f"could not read: {exc}",
+                                     "error": True})
+            continue
+        if not path.exists():
+            problems.append({"path": str(path), "reason": "no such file or directory",
+                             "error": True})
+            continue
+        if not path.is_file():
+            problems.append({"path": str(path), "reason": "not a regular file", "error": True})
+            continue
+        try:
+            python = looks_like_python(path)
+        except OSError as exc:
+            problems.append({"path": str(path), "reason": f"could not read: {exc}", "error": True})
+            continue
+        if python:
             files.append(path)
         else:
-            sys.stderr.write(f"pm-audit: skipping {path} (not .py or .ipynb)\n")
-    return files
+            problems.append({"path": str(path),
+                             "reason": "skipping (not .py or .ipynb, and no python shebang)",
+                             "error": False})
+    return files, problems
 
 
 def read_source(path: Path) -> str:
-    if path.suffix == ".ipynb":
-        try:
-            nb = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            sys.stderr.write(f"pm-audit: could not read {path}: {exc}\n")
-            return ""
-        return "\n".join("".join(c.get("source", []))
-                         for c in nb.get("cells", []) if c.get("cell_type") == "code")
-    return path.read_text(encoding="utf-8", errors="replace")
+    """Return the Python source of a file. Raises rather than returning an empty string."""
+    if path.suffix != ".ipynb":
+        return path.read_text(encoding="utf-8", errors="replace")
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(notebook, dict):
+        raise ValueError("notebook is not a JSON object")
+    cells = notebook.get("cells")
+    if not isinstance(cells, list):
+        raise ValueError("notebook has no list of cells")
+    chunks: list[str] = []
+    for cell in cells:
+        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
+            continue
+        source = cell.get("source")
+        if isinstance(source, str):
+            chunks.append(source)
+        elif isinstance(source, list):
+            chunks.append("".join(part for part in source if isinstance(part, str)))
+    return "\n".join(chunks)
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(prog="pm-audit", description=__doc__.split("\n")[0])
+# --------------------------------------------------------------------------- reporting
+
+
+def print_problems(problems: Sequence[Problem]) -> None:
+    if not problems:
+        return
+    unread = [p for p in problems if p["error"]]
+    skipped = [p for p in problems if not p["error"]]
+    if unread:
+        print(f"  {len(unread)} path(s) could not be audited and are not counted as scanned:")
+        for problem in unread:
+            print(f"    {problem['path']}: {problem['reason']}")
+    for problem in skipped:
+        print(f"  {problem['path']}: {problem['reason']}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="pm-audit", description=(__doc__ or "").split("\n")[0])
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--severity", choices=(HIGH, MED, LOW), default=LOW,
                     help="minimum severity to report (default: low, meaning everything)")
@@ -210,33 +488,49 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     order = {HIGH: 0, MED: 1, LOW: 2}
-    files = collect(args.paths)
-    if not files:
+    files, problems = collect(args.paths)
+
+    findings: list[Finding] = []
+    scanned: list[Path] = []
+    notebooks: list[Path] = []
+    for path in files:
+        try:
+            src = read_source(path)
+        except (OSError, ValueError, TypeError) as exc:
+            problems.append({"path": str(path), "reason": f"could not read: {exc}", "error": True})
+            continue
+        scanned.append(path)
+        if path.suffix == ".ipynb":
+            notebooks.append(path)
+        findings.extend(audit_source(path, src))
+
+    for problem in problems:
+        sys.stderr.write(f"pm-audit: {problem['path']}: {problem['reason']}\n")
+
+    if not scanned and not problems:
         sys.stderr.write("pm-audit: no Python or notebook files found\n")
         return 2
 
-    findings = []
-    notebooks = []
-    for f in files:
-        src = read_source(f)
-        if not src:
-            continue
-        if f.suffix == ".ipynb":
-            notebooks.append(f)
-        findings.extend(audit_source(f, src))
+    if not all(x["severity"] in order for x in findings):
+        raise RuntimeError("a rule declared a severity outside high|medium|low")
     findings = [x for x in findings if order[x["severity"]] <= order[args.severity]]
     findings.sort(key=lambda x: (order[x["severity"]], x["file"], x["line"]))
+    failed = any(p["error"] for p in problems)
 
     if args.json:
-        print(json.dumps({"files_scanned": len(files), "findings": findings}, indent=2))
+        print(json.dumps({"files_scanned": len(scanned), "findings": findings,
+                          "skipped": problems}, indent=2))
+        if failed or not scanned:
+            return 2
         return 1 if any(x["severity"] == HIGH for x in findings) else 0
 
-    print(f"pm-audit: {len(files)} file(s) scanned, {len(findings)} finding(s)")
+    print(f"pm-audit: {len(scanned)} file(s) scanned, {len(findings)} finding(s)")
     if notebooks:
         print(f"  {len(notebooks)} notebook(s) scanned. Notebook state does not correspond to "
               "notebook text; restart and run top to bottom before any number is used.")
+    print_problems(problems)
     print()
-    current = None
+    current: str | None = None
     for x in findings:
         if x["file"] != current:
             current = x["file"]
@@ -256,6 +550,8 @@ def main(argv=None):
     print("  mypy --strict <package>")
     print("  pytest --cov=<package> --cov-fail-under=80 --cov-report=term-missing")
     print("  the golden test and the noise test: references/coding-standards.md")
+    if failed or not scanned:
+        return 2
     return 1 if counts[HIGH] else 0
 
 

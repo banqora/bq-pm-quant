@@ -47,6 +47,34 @@ skewness and `γ₄` the sample kurtosis (so `γ₄ - 3` is excess kurtosis). Me
 Use this whenever excess kurtosis exceeds roughly 1 or absolute skewness exceeds roughly 0.5.
 State which SE was used.
 
+### The sampling frequency is a choice, and it flatters
+
+`k` is not a formatting detail. The same book sampled daily, weekly and monthly gives three
+different annualised Sharpes, and the disagreement between them is information, not noise.
+
+Under serial independence the three agree, which is what makes the choice look harmless. They
+diverge exactly when that assumption fails, and the divergence has a direction: coarser sampling
+cannot see the variation inside a period, so the volatility estimate falls and the ratio rises.
+
+- Monthly marks do not observe the intra-month path. A book down 12% mid-month that closes flat
+  contributes a zero to the monthly series and nothing to its measured volatility.
+- Positively autocorrelated returns — trend and momentum books, illiquid or appraisal-priced
+  holdings, smoothed NAVs — break square-root-of-time in the direction that understates annualised
+  volatility. The Lo adjustment below is the correction.
+- An intraday strategy reported on daily closes has the same defect one level down, and a daily
+  series annualised by `sqrt(252)` has it relative to the intraday path it actually ran.
+
+Procedure: compute the Sharpe at every frequency the data supports, report the set, and say which
+one the headline uses and why. A wide spread across frequencies is the smoothing signature and
+should be reported as that, not resolved by taking the highest. The defensible default is the
+frequency at which the book is marked and the risk is actually borne.
+
+Two consequences worth stating to a manager. A peer comparison across funds reporting at different
+frequencies is not like-for-like and cannot be repaired after the fact. And a single strategy's
+headline Sharpe near 2 has cheaper explanations than an edge — the sampling frequency, fees and
+financing not yet deducted, and whether the comparison set was filtered by survival. Check those
+three before treating the number as the finding.
+
 ### Autocorrelation and the Lo adjustment
 
 Square-root-of-time annualisation assumes serial independence. Positive autocorrelation, which
@@ -110,6 +138,23 @@ Two distinct problems, two distinct treatments. Do not confuse them.
 For a **single** strategy with no cross-section and a known trial count, deflation is the
 appropriate correction and shrinkage toward a peer mean is not available.
 
+### Corrections do not compose
+
+One selection problem takes one correction. Deflation for a search over specifications,
+empirical-Bayes shrinkage for noise across a cross-section, a haircut for an unknown trial count,
+and a Bayesian prior centred on zero are four estimates of the same discount from different
+angles. They are alternatives, not independent adjustments to be applied in series. Chaining them
+multiplies a single penalty and will extinguish an edge that any one of them, applied correctly,
+leaves standing.
+
+- Pick the one that matches the claim, name it, and report the uncorrected estimate beside it.
+- Where more than one is defensible, report them **side by side as alternatives**, each against the
+  same uncorrected figure, and say that is what they are.
+- A result that has survived four corrections has not been four times validated. It has been
+  discounted four times for one problem, and the surviving number is not interpretable.
+- The reader's question is "how much does the correction move it, and why that correction". A
+  chain answers neither.
+
 ## Information ratio
 
 `IR = mean(r_p - r_b) / sd(r_p - r_b)`, on active returns against the mandated benchmark.
@@ -131,9 +176,9 @@ appropriate correction and shrinkage toward a peer mean is not available.
   (1/T)·Σ min(r_t - τ, 0)² )`. Declare `τ` (zero and the risk-free are both used and give
   different answers) and declare whether the sum divides by `T` or by the count of downside
   observations. The former is standard; the latter is not comparable across series.
-- **Calmar** is annualised return over maximum drawdown, conventionally on 36 months. Maximum
-  drawdown is an extreme-order statistic with enormous sampling variance and grows mechanically
-  with sample length. Calmar is not comparable across track records of different length.
+- **Calmar** is annualised return over maximum drawdown, conventionally on 36 months. It inherits
+  the sampling behaviour of its denominator (see [Drawdown](#drawdown) below), so it is not
+  comparable across track records of different length.
 - **Omega**, gain-loss ratios, and similar are functions of the full distribution and are highly
   sensitive to the threshold. Report the threshold.
 - None of these have well-behaved standard errors in small samples. If reported at all, report
@@ -144,9 +189,10 @@ appropriate correction and shrinkage toward a peer mean is not available.
 - Maximum drawdown `MDD = max_t (1 - W_t / max_{s≤t} W_s)` on the cumulative wealth series.
 - Report with: date of peak, date of trough, date of recovery or "not recovered", and duration.
   The depth alone is not informative.
-- Expected maximum drawdown grows with the square root of horizon and inversely with Sharpe. A
-  longer backtest will show a larger MDD with no change in the underlying process. Comparing MDD
-  across differently-sized samples is invalid without adjustment.
+- Maximum drawdown is an extreme-order statistic: its sampling variance is very large, it grows
+  with the square root of horizon and inversely with Sharpe, and it grows mechanically with sample
+  length. A longer backtest will show a larger MDD with no change in the underlying process.
+  Comparing MDD across differently-sized samples is invalid without adjustment.
 - Drawdown on a monthly series understates drawdown on the daily series of the same portfolio.
   Declare the frequency.
 - Time-under-water and the drawdown duration distribution are usually more decision-relevant to a
@@ -184,13 +230,13 @@ window 2015-01-02..2024-12-31 | n=2516 daily | simple total returns, USD
 excess of SOFR (act/360) | ddof=1 | k=252 | gross of costs | vintage 2025-01-15
 
 metric                    value     se      t       method
-ann. arithmetic excess    9.14%    2.41%   3.79    iid
+ann. arithmetic excess    9.14%    3.83%   2.39    iid
 ann. geometric (CAGR)     8.32%       -       -    compounded
 ann. volatility          12.09%    0.17%      -    ddof=1
-Sharpe (ann.)             0.756    0.204   3.71    Mertens (skew -0.61, exkurt 4.2)
-Sharpe (ann., Lo)         0.712    0.199   3.58    rho1=0.07, q=252
+Sharpe (ann.)             0.756    0.322   2.35    Mertens (skew -0.61, exkurt 4.2)
+Sharpe (ann., Lo)         0.712    0.303   2.35    rho1=0.07, q=252
 max drawdown            -18.4%        -       -    2020-02-19 to 2020-03-23, rec 2020-08-11
 turnover (one-way, ann.)   412%        -       -
 break-even cost           22bp        -       -    round trip on notional traded
-trials searched              6                     deflated Sharpe 0.61
+trials searched              6                     deflated Sharpe 0.61, trial SR sd 0.51 ann.
 ```

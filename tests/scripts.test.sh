@@ -89,6 +89,8 @@ assert_contains "reports information ratio" "information ratio" "$act"
 assert_contains "reports beta"              "beta vs benchmark" "$act"
 
 # ---------------------------------------------------------------- pm-audit
+# One construct per rule. Folding them together hid a genuine double-report: the generic
+# SILENT-FALLBACK and the specific EXCEPT-DEFAULT both fired on a single handler.
 cat > leaky.py <<'PY'
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -96,10 +98,19 @@ RISK_FREE = 0.02
 def signal(prices):
     return prices.pct_change().shift(-1)
 def sharpe(r):
-    try:
+    try:                                  # EXCEPT-DEFAULT: handler returns a constant
         return r.mean() / np.std(r) * np.sqrt(252)
     except Exception:
         return 0.0
+def clean(df):
+    try:                                  # SILENT-FALLBACK: broad handler, not a constant return
+        return df.fillna(0)               # SILENT-ZERO: missing filled as measured
+    except Exception:
+        return df.dropna()
+def beta(p, b):
+    if len(p) < 20:                       # SILENT-ZERO: unknown reported as a measured zero
+        return 0.0
+    return np.cov(p, b)[0][1] / np.var(b)
 def te(p, b):
     return np.std(p.iloc[:min_len].values - b.iloc[:min_len].values)
 PY
@@ -219,6 +230,13 @@ monthly="$("$BIN/pm-stats" good.csv 2>/dev/null)"
 assert_contains "pm-stats honours the stored periods_per_year" "k=12" "$monthly"
 explicit="$("$BIN/pm-stats" good.csv --periods-per-year 252 2>/dev/null)"
 assert_contains "an explicit flag overrides the stored preference" "k=252" "$explicit"
+# argparse accepts an unambiguous abbreviation, so deciding whether a flag was passed by looking
+# for its full spelling in sys.argv lets the stored preference win a run the manager overrode.
+# Every annualised figure would then be wrong by a factor of sqrt(k_stored / k_intended).
+abbrev="$("$BIN/pm-stats" good.csv --periods 252 2>/dev/null)"
+assert_contains "an abbreviated flag also overrides the stored preference" "k=252" "$abbrev"
+abbrev_dc="$("$BIN/pm-stats" good.csv --rf 0.04 --rf-day compounded 2>/dev/null)"
+assert_contains "an abbreviated --rf-daycount is honoured too" "compounded" "$abbrev_dc"
 
 # a corrupt preferences file must not be silently ignored into wrong defaults
 echo 'not json' > .bq-pm-quant.json
@@ -278,6 +296,164 @@ assert_contains "pm-stats explains the two possible causes" "unadjusted corporat
 assert_contains "pm-stats refuses to guess"                  "will not guess" "$pc"
 assert_ok "an explicit override accepts the series" \
   "$BIN/pm-stats" pct.csv --allow-extreme-returns
+
+# --------------------------------------------- conventions, risk-free, and integrity
+rm -f .bq-pm-quant.json
+"$BIN/pm-prefs" unset risk_free_daycount >/dev/null 2>&1
+"$BIN/pm-prefs" unset return_type >/dev/null 2>&1
+
+# --- a stored preference this tool cannot honour must raise, never be dropped ---------------
+echo '{"risk_free_daycount": "30/360"}' > .bq-pm-quant.json
+assert_fails "pm-stats refuses an unimplemented stored day count" "$BIN/pm-stats" good.csv --rf 0.05
+dcerr="$("$BIN/pm-stats" good.csv --rf 0.05 2>&1 || true)"
+assert_contains "it lists the day counts it does implement" "simple-annual | compounded | act/360" "$dcerr"
+assert_contains "it says it will not substitute one" "will not fall back to simple-annual" "$dcerr"
+echo '{"return_type": "geometric"}' > .bq-pm-quant.json
+assert_fails "pm-stats refuses an unrecognised stored return_type" "$BIN/pm-stats" good.csv
+rm -f .bq-pm-quant.json
+
+# --- act/360 and act/365 are implemented on the calendar, not as annual/k -------------------
+"$BIN/pm-prefs" set risk_free_daycount act/360 --project >/dev/null
+ac="$("$BIN/pm-stats" good.csv --rf 0.05 2>/dev/null)"
+assert_contains "a stored act/360 day count is applied" "act/360" "$ac"
+assert_contains "act/360 states the calendar-day gaps it charged" "calendar days" "$ac"
+assert_contains "act/360 states how the first observation was handled" "median gap" "$ac"
+rm -f .bq-pm-quant.json
+a360="$("$BIN/pm-stats" good.csv --rf 0.05 --rf-daycount act/360 --json 2>/dev/null | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["sharpe"]["sharpe_ann"])')"
+a365="$("$BIN/pm-stats" good.csv --rf 0.05 --rf-daycount act/365 --json 2>/dev/null | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["sharpe"]["sharpe_ann"])')"
+asa="$("$BIN/pm-stats" good.csv --rf 0.05 --rf-daycount simple-annual --json 2>/dev/null | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["sharpe"]["sharpe_ann"])')"
+distinct="$(python3 -c "print('yes' if $a360 != $asa and $a365 != $a360 else 'no')")"
+assert_eq "act/360 and act/365 are not aliases for annual/252" "yes" "$distinct"
+assert_fails "act/360 without a date index raises rather than degrading" \
+  "$BIN/pm-stats" nodate.csv --rf 0.05 --rf-daycount act/360
+noda="$("$BIN/pm-stats" nodate.csv --rf 0.05 --rf-daycount act/360 2>&1 || true)"
+assert_contains "it says what it was unable to do and why" "I was unable to apply the act/360" "$noda"
+assert_contains "it offers the date-free conventions by name" "--rf-daycount simple-annual" "$noda"
+
+# --- --rf-col is honoured or the run fails; it is never reported as a zero rate -------------
+assert_fails "pm-stats refuses --rf and --rf-col together" \
+  "$BIN/pm-stats" withrf.csv --rf 0.05 --rf-col rf
+bothrf="$("$BIN/pm-stats" withrf.csv --rf 0.05 --rf-col rf 2>&1 || true)"
+assert_contains "it says why it will not choose between them" "two different risk-free series" "$bothrf"
+assert_fails "pm-stats refuses a --rf-daycount that --rf-col makes inapplicable" \
+  "$BIN/pm-stats" withrf.csv --rf-col rf --rf-daycount compounded
+assert_fails "pm-stats refuses an --rf-col that is not in the file" \
+  "$BIN/pm-stats" withrf.csv --rf-col missing_rate
+norf="$("$BIN/pm-stats" withrf.csv --rf-col missing_rate 2>&1 || true)"
+assert_contains "it names the columns that are present" "columns present" "$norf"
+python3 - <<'PY4'
+import csv
+rows = [(f"2019-01-{d:02d}", "0.001", "0.00012" if d != 3 else "") for d in range(1, 9)]
+with open("blankrf.csv", "w", newline="") as fh:
+    w = csv.writer(fh); w.writerow(["date", "return", "rf"]); w.writerows(rows)
+PY4
+assert_fails "pm-stats refuses a blank cell in the risk-free column" \
+  "$BIN/pm-stats" blankrf.csv --rf-col rf
+blankerr="$("$BIN/pm-stats" blankrf.csv --rf-col rf 2>&1 || true)"
+assert_contains "it refuses to substitute a zero rate for the gap" "will not substitute a zero rate" "$blankerr"
+
+# --- a zero price is an undefined return, not a row to drop ---------------------------------
+python3 - <<'PY5'
+import csv, datetime
+d, rows = datetime.date(2020, 1, 1), []
+p = 100.0
+for i in range(40):
+    p *= 1.001
+    rows.append((d.isoformat(), f"{0.0 if i == 4 else p:.6f}"))
+    d += datetime.timedelta(days=1)
+with open("zeropx.csv", "w", newline="") as fh:
+    w = csv.writer(fh); w.writerow(["date", "close"]); w.writerows(rows)
+PY5
+assert_fails "pm-stats refuses a zero price in a price series" "$BIN/pm-stats" zeropx.csv --is-price
+zp="$("$BIN/pm-stats" zeropx.csv --is-price 2>&1 || true)"
+assert_contains "it names the offending line and date" "line 6 (2020-01-05)" "$zp"
+assert_contains "it explains that the return is undefined" "undefined across a zero or negative price" "$zp"
+assert_contains "it explains what dropping the row would cost" "attached to the wrong date" "$zp"
+# the same file with no parsable dates used to reach the report as a zero risk-free rate
+python3 - <<'PY6'
+import csv
+rows = []
+p = 100.0
+for i in range(40):
+    p *= 1.001
+    rows.append((f"wk{i}", f"{0.0 if i == 4 else p:.6f}", "0.0002"))
+with open("zeropx_nodate.csv", "w", newline="") as fh:
+    w = csv.writer(fh); w.writerow(["date", "close", "rf"]); w.writerows(rows)
+PY6
+assert_fails "a zero price without dates fails rather than silently dropping the risk-free column" \
+  "$BIN/pm-stats" zeropx_nodate.csv --is-price --rf-col rf
+zpn="$("$BIN/pm-stats" zeropx_nodate.csv --is-price --rf-col rf 2>&1 || true)"
+assert_not_contains "it does not report the run as raw returns" "raw returns; Sharpe" "$zpn"
+
+# --- invariants must survive python -O, which strips assert -----------------------------
+assert_eq "pm-stats has no bare assert statements" "0" \
+  "$(grep -cE '^[[:space:]]*assert ' "$BIN/pm-stats" || true)"
+assert_ok "pm-stats runs under python -O" python3 -O "$BIN/pm-stats" good.csv
+
+# --- drawdown reports both durations, and does not misdate a peak at the series start -------
+dr="$("$BIN/pm-stats" good.csv 2>/dev/null)"
+assert_contains "reports the peak-to-trough duration" "peak-to-trough" "$dr"
+assert_contains "reports the peak-to-recovery duration" "peak-to-recovery" "$dr"
+durs="$("$BIN/pm-stats" good.csv --json 2>/dev/null | python3 -c \
+  'import json,sys; d=json.load(sys.stdin)["drawdown"]; print("yes" if d["peak_to_recovery_periods"] > d["peak_to_trough_periods"] > 0 else "no")')"
+assert_eq "peak-to-recovery is longer than peak-to-trough" "yes" "$durs"
+printf 'date,return\n2020-01-01,-0.10\n2020-01-02,-0.20\n2020-01-03,0.50\n2020-01-06,0.02\n' > fallfirst.csv
+ff="$("$BIN/pm-stats" fallfirst.csv 2>/dev/null)"
+assert_contains "a peak at the starting wealth is labelled, not dated to the first return" \
+  "peak series start" "$ff"
+assert_not_contains "the first return date is not reported as the peak" "peak 2020-01-01" "$ff"
+"$BIN/pm-stats" good.csv --csv dd.csv >/dev/null 2>&1
+ddcsv="$(cat dd.csv)"
+assert_contains "csv carries the peak-to-trough duration" "max_drawdown_peak_to_trough_periods" "$ddcsv"
+assert_contains "csv carries the peak-to-recovery duration" "max_drawdown_peak_to_recovery_periods" "$ddcsv"
+assert_contains "csv carries the day-count convention" "# risk_free_daycount" "$ddcsv"
+
+# --- the active block carries the same standard errors as the main block --------------------
+act2="$("$BIN/pm-stats" good.csv --benchmark bench.csv 2>/dev/null)"
+assert_contains "the active block names the benchmark" "active vs bench.csv" "$act2"
+assert_contains "the active block reports a Newey-West t on the active return" "Newey-West" "$act2"
+assert_contains "the active block reports a Lo-adjusted IR" "information ratio (Lo)" "$act2"
+ircheck="$("$BIN/pm-stats" good.csv --benchmark bench.csv --json 2>/dev/null | python3 -c \
+  'import json,sys
+a = json.load(sys.stdin)["active"]
+present = all(k in a for k in ("se_ir_mertens", "t_ir_mertens", "ir_lo", "se_ir_lo",
+                               "se_ann_active_nw", "t_active_nw"))
+iid = abs(a["t_ir"] - a["ir"] / a["se_ir"]) < 1e-9
+mer = abs(a["t_ir_mertens"] - a["ir"] / a["se_ir_mertens"]) < 1e-9
+nw = abs(a["t_active_nw"] - a["ann_active"] / a["se_ann_active_nw"]) < 1e-9
+print("yes" if present and iid and mer and nw else "no")')"
+assert_eq "every active row satisfies t = value / se" "yes" "$ircheck"
+
+# --- the zero-run scan must not undercount a run at the start of the history ---------------
+python3 - <<'PY7'
+import csv, datetime
+d, rows = datetime.date(2021, 1, 1), []
+for i in range(300):
+    rows.append((d.isoformat(), 0.0 if i < 5 else (0.004 if i % 2 else -0.003)))
+    d += datetime.timedelta(days=1)
+with open("padded.csv", "w", newline="") as fh:
+    w = csv.writer(fh); w.writerow(["date", "return"]); w.writerows(rows)
+PY7
+pad="$("$BIN/pm-stats" padded.csv 2>/dev/null)"
+assert_contains "a vendor pad of five leading zeros is counted as five" "longest zero run 5" "$pad"
+assert_contains "and trips the stale-price flag" "consecutive zero returns: stale price" "$pad"
+
+# --- pm-prefs and pm-stats must share one day-count vocabulary ------------------------------
+assert_ok "pm-prefs accepts act/360" "$BIN/pm-prefs" set risk_free_daycount act/360
+assert_ok "pm-prefs accepts act/365" "$BIN/pm-prefs" set risk_free_daycount act/365
+assert_fails "pm-prefs refuses a day count pm-stats does not implement" \
+  "$BIN/pm-prefs" set risk_free_daycount 30/360
+assert_fails "pm-prefs refuses an unrecognised return_type" "$BIN/pm-prefs" set return_type geometric
+keys="$("$BIN/pm-prefs" keys)"
+stats_help="$("$BIN/pm-stats" --help)"
+for dc in simple-annual compounded act/360 act/365; do
+  assert_contains "pm-prefs documents the $dc day count" "$dc" "$keys"
+  assert_contains "pm-stats accepts the $dc day count" "$dc" "$stats_help"
+done
+"$BIN/pm-prefs" unset risk_free_daycount >/dev/null 2>&1
 
 # ---------------------------------------------------------------- help
 for s in pm-stats pm-audit pm-docs pm-prefs; do

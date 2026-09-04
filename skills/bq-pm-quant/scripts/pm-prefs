@@ -24,20 +24,33 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Final
 
-KEYS = {
+PrefValue = str | int | float | bool
+"""What a preference file may hold. Anything richer belongs in a config file, not here."""
+
+DAYCOUNTS: Final[tuple[str, ...]] = ("simple-annual", "compounded", "act/360", "act/365")
+"""Accepted risk-free day-count conventions. The same vocabulary is the `--rf-daycount` choice
+set in pm-stats; change both together or a stored preference and the flag stop meaning the same
+thing."""
+
+RETURN_TYPES: Final[tuple[str, ...]] = ("simple", "log")
+
+KEYS: Final[dict[str, tuple[str, str]]] = {
     "output_format": ("How to deliver a large result",
                       "console | csv | xlsx | html | json"),
     "output_dir": ("Where result files are written", "a path, default ./results"),
     "ask_format_threshold": ("Row count above which to ask about format, if unset",
                              "an integer, default 20"),
     "periods_per_year": ("Observations per year for annualisation", "252 | 12 | 52 | 4"),
-    "return_type": ("Return construction", "simple | log"),
+    "return_type": ("Return construction", " | ".join(RETURN_TYPES)),
     "total_return": ("Total return or price return", "true | false"),
     "risk_free": ("Risk-free instrument", "e.g. SOFR, ESTR, SONIA, UST3M, none"),
-    "risk_free_daycount": ("Conversion of the quoted rate to a period rate",
-                           "simple-annual | compounded"),
+    "risk_free_daycount": ("Conversion of the quoted rate to a period rate; act/360 and act/365 "
+                           "charge the actual calendar days between observations and need dates",
+                           " | ".join(DAYCOUNTS)),
     "base_currency": ("Reporting currency", "e.g. USD, EUR, GBP"),
     "benchmark": ("Default benchmark for active statistics", "an identifier or a file path"),
     "cost_bps_round_trip": ("Default round-trip cost assumption in basis points", "a number"),
@@ -48,13 +61,14 @@ KEYS = {
     "data_vintage": ("Snapshot identifier for the current data pull", "a date or a hash"),
 }
 
-USER_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) \
+USER_PATH: Final[Path] = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) \
     / "bq-pm-quant" / "preferences.json"
-PROJECT_PATH = Path.cwd() / ".bq-pm-quant.json"
-ENV_PATH = Path(os.environ["BQ_PM_QUANT_PREFS"]) if os.environ.get("BQ_PM_QUANT_PREFS") else None
+PROJECT_PATH: Final[Path] = Path.cwd() / ".bq-pm-quant.json"
+ENV_PATH: Final[Path | None] = (Path(os.environ["BQ_PM_QUANT_PREFS"])
+                                if os.environ.get("BQ_PM_QUANT_PREFS") else None)
 
 
-def _load(path: Path):
+def _load(path: Path | None) -> dict[str, PrefValue]:
     if not path or not path.is_file():
         return {}
     try:
@@ -68,9 +82,11 @@ def _load(path: Path):
     return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
-def resolve():
-    sources = [(PROJECT_PATH, "project"), (ENV_PATH, "env"), (USER_PATH, "user")]
-    merged, origin = {}, {}
+def resolve() -> tuple[dict[str, PrefValue], dict[str, str]]:
+    sources: list[tuple[Path | None, str]] = [
+        (PROJECT_PATH, "project"), (ENV_PATH, "env"), (USER_PATH, "user")]
+    merged: dict[str, PrefValue] = {}
+    origin: dict[str, str] = {}
     for path, label in sources:
         for k, v in _load(path).items():
             if k not in merged:
@@ -78,16 +94,17 @@ def resolve():
     return merged, origin
 
 
-def _write(path: Path, updates, remove=None):
+def _write(path: Path, updates: Mapping[str, PrefValue],
+           remove: Iterable[str] | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    current = {}
+    current: dict[str, PrefValue] = {}
     if path.is_file():
         try:
             current = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             sys.stderr.write(f"pm-prefs: {path} is unreadable; refusing to overwrite it. "
                              "Fix or remove it first.\n")
-            raise SystemExit(1)
+            raise SystemExit(1) from None
     current.update(updates)
     for k in (remove or []):
         current.pop(k, None)
@@ -95,19 +112,38 @@ def _write(path: Path, updates, remove=None):
     return path
 
 
-def coerce(key, raw):
+def coerce(key: str, raw: str) -> PrefValue:
+    """Parse and validate a value before it is stored.
+
+    A value pm-stats cannot honour is rejected here, at the point the manager states it, rather
+    than being written and then quietly ignored on every later run.
+    """
     if key in ("periods_per_year", "ask_format_threshold"):
-        return int(raw)
+        try:
+            return int(raw)
+        except ValueError:
+            raise SystemExit(f"pm-prefs: {key} must be an integer; got {raw!r}") from None
     if key in ("cost_bps_round_trip", "significance_hurdle_t"):
-        return float(raw)
+        try:
+            return float(raw)
+        except ValueError:
+            raise SystemExit(f"pm-prefs: {key} must be a number; got {raw!r}") from None
     if key == "total_return":
         if raw.lower() not in ("true", "false"):
             raise SystemExit(f"pm-prefs: {key} must be true or false")
         return raw.lower() == "true"
+    if key == "risk_free_daycount" and raw not in DAYCOUNTS:
+        raise SystemExit(
+            f"pm-prefs: risk_free_daycount must be one of {' | '.join(DAYCOUNTS)}; got {raw!r}. "
+            "pm-stats refuses to run against a day count it does not implement rather than "
+            "silently substituting one, so storing this value would only break the next run.")
+    if key == "return_type" and raw not in RETURN_TYPES:
+        raise SystemExit(
+            f"pm-prefs: return_type must be one of {' | '.join(RETURN_TYPES)}; got {raw!r}.")
     return raw
 
 
-def main(argv):
+def main(argv: Sequence[str]) -> int:
     if not argv:
         merged, origin = resolve()
         if not merged:
@@ -123,7 +159,7 @@ def main(argv):
             print(f"{k:<{width}}  {json.dumps(merged[k]):<24}  {origin[k]}{unknown}")
         return 0
 
-    cmd, rest = argv[0], argv[1:]
+    cmd, rest = argv[0], list(argv[1:])
 
     if cmd in ("-h", "--help", "help"):
         print(__doc__)
@@ -171,7 +207,7 @@ def main(argv):
     if cmd == "init":
         if target.is_file():
             raise SystemExit(f"pm-prefs: {target} already exists; edit it or use 'set'")
-        starter = {
+        starter: dict[str, PrefValue | str] = {
             "_comment": ("Preferences for the bq-pm-quant skill. Anything set here is not asked "
                          "again. Run 'pm-prefs keys' for the documented keys."),
             "output_format": "csv",

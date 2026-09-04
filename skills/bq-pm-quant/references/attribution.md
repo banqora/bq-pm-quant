@@ -143,9 +143,11 @@ it. Do not adjudicate without doing this.
 
 ```
 window, frequency, linking method, weight convention, classification scheme and vintage
+2024-01-01..2024-12-31 | single period, no linking | Brinson-Fachler, three-way |
+beginning-of-period weights | GICS, vintage 2024-12-31
 
 segment        w_p     w_b    r_p      r_b     allocation  selection  interaction  total
-Technology    24.1%  18.3%   14.2%    11.8%       +0.31%     +0.44%       +0.14%   +0.89%
+Technology    24.1%  18.3%   14.2%    11.8%       +0.28%     +0.44%       +0.14%   +0.86%
 ...
 total        100.0% 100.0%    9.41%    7.02%      +0.88%     +1.36%       +0.15%   +2.39%
 

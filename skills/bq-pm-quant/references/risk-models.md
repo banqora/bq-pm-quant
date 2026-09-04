@@ -149,9 +149,9 @@ denominator**. This is a common and silent error.
 
 ## Drawdown-based risk
 
-- Maximum drawdown is an extreme-order statistic. Its sampling variance is very large and it grows
-  mechanically with sample length, so it is not comparable across track records of different
-  length.
+- Maximum drawdown's sampling behaviour, and why it is not comparable across track records of
+  different length, is in [performance
+  statistics](performance-statistics.md#drawdown). Everything below is what a risk model adds.
 - **Rolling or economic drawdown**, measured against a rolling peak over a fixed lookback rather
   than the all-time peak, is more stable and more decision-relevant for a live book. State the
   lookback.

@@ -168,6 +168,16 @@ must not trigger it.
 Eight cases at one run each is a smoke test, not a measurement. A green run means no known
 regression. See [evals/README.md](evals/README.md).
 
+## Custom integrations
+
+The skill is deliberately self-contained: standard library only, offline, and it starts from a
+return series you already have. Getting that series out of a terminal or a risk system is the step
+it does not do.
+
+If you need that step — Bloomberg, FactSet or Refinitiv extraction, a custodian or admin feed,
+point-in-time universe and membership history, or the skill wired into an existing research stack —
+contact **contact@banqora.com**.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

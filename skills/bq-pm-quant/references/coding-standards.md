@@ -131,6 +131,37 @@ repos:
 Pin the versions. An estimator default that changes between library releases changes your results
 with no commit of your own.
 
+### Use the library implementation
+
+Do not hand-roll an estimator a maintained library already provides. A rewritten Newey-West, a
+rational approximation to the normal quantile, or a bespoke incomplete beta is a second
+implementation of a solved problem, and it is your implementation the manager is now trusting
+without an independent check. The library version is tested against reference values by more
+people than will ever read your code.
+
+| Quantity | Use | Not |
+|---|---|---|
+| Distributions, quantiles, tail probabilities | `scipy.stats` (`norm`, `t`, `chi2`) | A rational approximation you pasted in |
+| HAC / Newey-West standard errors | `statsmodels` `OLS(...).fit(cov_type="HAC", cov_kwds={"maxlags": L})` | A hand-rolled Bartlett kernel |
+| Regression, alpha and beta with SEs | `statsmodels.api.OLS` | `numpy.polyfit`, or a covariance ratio with no SE |
+| Ljung-Box, ADF, autocorrelation | `statsmodels.stats.diagnostic`, `statsmodels.tsa.stattools` | A loop over lags |
+| Ledoit-Wolf and OAS shrinkage | `sklearn.covariance.LedoitWolf`, `OAS` | An intensity you tuned by hand |
+| Eigenvalues, condition number, nearest PSD | `numpy.linalg`, `scipy.linalg` | Anything |
+| Stationary and circular block bootstrap | `arch.bootstrap` | An iid resample you called a bootstrap |
+| Moments, quantiles, resampling, calendars | `numpy`, `pandas` | A pure-Python loop |
+
+Two things this does not license. Pin the versions — an estimator default that changes between
+releases changes your results with no commit of your own. And know what the default is: `numpy.std`
+is `ddof=0`, `pandas.Series.std` is `ddof=1`, and `scipy.stats.skew` is `bias=True` unless you say
+otherwise. A library call with the wrong default is worse than a hand-rolled function, because it
+carries borrowed authority.
+
+Where a dependency genuinely cannot be added — a locked-down desk, a tool that must run anywhere
+with no install — say so in the module docstring, implement against a published reference, and
+test the result against known values rather than against whatever the code currently returns. That
+exemption is scoped and stated, not assumed. `scripts/pm-stats` in this skill is exactly that
+case and says so at the top.
+
 ### Typing that carries meaning
 
 Annotating everything as a dataframe or series satisfies the type checker and prevents nothing.
@@ -242,7 +273,7 @@ class Config:
     return_type: str = "simple"        # simple | log
     total_return: bool = True
     risk_free: str = "SOFR"
-    risk_free_daycount: str = "act/360"
+    risk_free_daycount: str = "act/360"  # simple-annual | compounded | act/360 | act/365
     base_currency: str = "USD"
     rebalance: str = "monthly"
     drift_weights: bool = True          # buy-and-hold between rebalances
@@ -296,22 +327,34 @@ conduct](analyst-conduct.md#report-failure-explicitly-in-the-first-person-with-t
 
 ## Assertions on invariants
 
-Assert what must be true, at the point it must be true. These catch the majority of silent defects
+Check what must be true, at the point it must be true. These catch the majority of silent defects
 and cost nothing.
 
+State them as raises, not as `assert`. `python -O` strips every assert statement, so an invariant
+guarding a reported number vanishes the moment the pipeline is run optimised — silently, and in
+the unattended deployment where nobody is watching for it. Keep `assert` for tests, where the
+interpreter flag belongs to the test runner.
+
 ```python
-assert idx.is_monotonic_increasing and idx.is_unique
-assert returns.index.equals(benchmark.index)          # before any pair statistic
-assert weights.index.equals(prior_returns.index)      # alignment, not position
-assert abs(weights.sum() - config.gross_target) < 1e-8
-assert not returns.isna().any().any(), returns.isna().sum()[lambda s: s > 0]
-assert signal.index.max() < forward_returns.index.min()   # the lag contract
-assert returns.abs().max() < 1.0, "check for unadjusted corporate action"
-assert np.linalg.eigvalsh(cov).min() > 0, "covariance is not positive definite"
+def require(condition: bool, message: str) -> None:
+    """Invariant check that survives -O. The message names the defect, not the expression."""
+    if not condition:
+        raise ValueError(message)
+
+
+require(idx.is_monotonic_increasing and idx.is_unique, "date index not unique and monotonic")
+require(returns.index.equals(benchmark.index), "pair statistic on unaligned dates")
+require(weights.index.equals(prior_returns.index), "weights aligned by position, not by date")
+require(abs(weights.sum() - cfg.gross_target) < 1e-8, f"weights sum to {weights.sum():.6f}")
+require(not returns.isna().any().any(), f"NaN reaching an estimator: {returns.isna().sum()}")
+require(signal.index.max() < forward_returns.index.min(), "lag contract violated")
+require(returns.abs().max() < 1.0, "check for unadjusted corporate action")
+require(np.linalg.eigvalsh(cov).min() > 0, "covariance is not positive definite")
 ```
 
-The alignment assertion and the lag assertion together prevent two of the three most common
-catastrophic defects in this domain.
+The alignment check and the lag check together prevent two of the three most common
+catastrophic defects in this domain. The `1.0` bound on the corporate-action check is the
+middle of three tiers; see [data integrity](data-integrity.md#corporate-actions).
 
 ## The golden test
 

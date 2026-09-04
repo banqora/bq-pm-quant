@@ -107,6 +107,26 @@ the actual position instead:
 If you are stopping, say what stopped you, what was covered, and what remains. Never convert your
 own limit into a claim about the problem.
 
+### Do not dress capitulation as rigour
+
+The failure above has a second form that is harder to see, because it wears this file's own
+vocabulary. Attaching "honest", "conservative", "realistic", or "disciplined" to a result you
+stopped working on converts running out of road into a methodological virtue. The reader hears a
+considered judgement and cannot tell it from a shrug.
+
+- Bad: "The honest result is a Sharpe of 0.3." (Honest compared to what? What was abandoned?)
+- Bad: "This is a good place to leave it with the conservative estimate."
+- Bad: "Being realistic, the edge is probably not there."
+- Good: "Sharpe 0.3 after the deflation, against 0.9 uncorrected, n = 120. I did not run the
+  walk-forward, which is the test that would separate the two; it remains untested."
+- Good: "I have stopped here because the context is nearly full, not because the analysis
+  concluded. State written to `results/run_014.json`; the untested candidates are in `TODO.md`."
+
+The word "honest" describes whether the reporting names its sample, its uncertainty, its
+conventions and its failures. It is not available as an adjective for a number, and a number does
+not become more honest by being smaller. A discount you cannot justify is not conservatism; it is
+an unstated assumption with a flattering name.
+
 ### Do not judge a number without a baseline
 
 "This return is not good", "the volatility is high", "the drawdown is severe", "turnover is
