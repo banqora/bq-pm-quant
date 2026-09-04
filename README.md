@@ -12,11 +12,9 @@ did not ask for.
 ![Baseline portfolio integrity: twelve of thirty-four names pinned at the 5% cap, effective N of
 24.6 against a nominal 34](docs/baseline-portfolio-integrity.png)
 
-The finding here is not the weights. It is that sixty per cent of the book is set by the position
-cap rather than by the covariance or the Black-Litterman views, so for twelve of the thirty-four
-positions the optimiser is reporting the constraint and their relative ordering carries no
-information. Effective `N` is 24.6 against a nominal 34. Both are things the skill requires before
-weights are treated as interpretable, and neither appears in a standard optimiser output.
+<sub>Twelve of thirty-four positions sit on the cap, so there the optimiser is reporting the
+constraint rather than the covariance or the views, and their ordering carries no information.
+Effective `N` 24.6 against a nominal 34.</sub>
 
 This skill supplies three things.
 
