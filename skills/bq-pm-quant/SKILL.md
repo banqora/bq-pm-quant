@@ -147,6 +147,36 @@ record, and a validation fold that was inspected is not a holdout.
     stored. Carry the conventions and standard errors into whichever format is chosen. See
     [analyst conduct](references/analyst-conduct.md#deliver-the-output-in-a-usable-form).
 
+## Split the work, and say that you did
+
+The manager will not ask for this, because they do not know it is available. Offer it. Most of
+this work is independent, and running it sequentially costs them an afternoon for no reason.
+
+Split into subagents when the pieces share no state: the same statistics block across several
+funds, sleeves or share classes; a specification sweep; walk-forward or cross-validation folds;
+bootstrap replications; an inherited-code review split by defect class — lag discipline,
+conventions, alignment, silent fallbacks — each of which is a separate read of the same files.
+Give each agent its own git worktree when they write to one repository, so one agent's edit cannot
+land inside another's file.
+
+Three things stay central. Getting them wrong is worse than not splitting at all, because the
+failure is silent and arrives as numbers that nearly agree.
+
+- **One config object, passed in.** Agents that each pick their own periods-per-year, risk-free or
+  cost assumption return figures that do not reconcile, which is exactly the divergence [return
+  conventions](references/return-conventions.md) exists to prevent.
+- **One trial log.** Five agents trying eight specifications each is a search of forty, not eight.
+  Parallelism multiplies the multiple-testing problem silently and the surviving t-statistic must
+  be corrected against the total. Aggregate before any p-value is reported. See [out of
+  sample](references/out-of-sample.md#the-trial-log).
+- **Seeds allocated centrally** from the config's base seed, never drawn per agent, or the run
+  stops being reproducible and the determinism check in [coding
+  standards](references/coding-standards.md#determinism-and-reproducibility) fails.
+
+Report what was split and what each branch returned. A manager who cannot read the code still
+needs to know the work was divided, because it changes what a failure in one branch means for the
+result as a whole.
+
 ## Load only what the task needs
 
 - [Analyst conduct](references/analyst-conduct.md): output contract, legitimate versus

@@ -141,6 +141,12 @@ trial_id  ts                   spec_hash  universe  window            sharpe   n
 0041      2025-03-06T16:02:55  9de4...    R1000     2010-01..2019-12   1.12   2516   y
 ```
 
+**A parallel search is one search.** Work split across agents, machines or sessions produces one
+trial count, not one per branch. Five agents evaluating eight specifications each have between
+them searched forty, and the winner is the maximum of forty draws. Aggregating the branches after
+the fact is easy and forgetting to is the default, because each branch's own log looks modest.
+Write to one log, keyed by a run id, before any branch reports a p-value.
+
 When the count is genuinely unknown — inherited work, exploratory sessions not logged — say so and
 report the statistic without a p-value. An uncorrected p-value from an unmeasured search is worse
 than no p-value, because it will be read as if it meant something.

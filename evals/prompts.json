@@ -30,7 +30,10 @@
     "our custodian file and the front office disagree on last month's return by 12bp",
     "the consultant says our information ratio is 0.4, ours says 0.7, who is wrong",
     "how long does a track record need to be before the board can rely on it",
-    "is the alpha in this fund report statistically distinguishable from zero"
+    "is the alpha in this fund report statistically distinguishable from zero",
+    "run the same performance stats across all eleven sleeves in this fund",
+    "sweep the lookback from 20 to 250 days and tell me which is best",
+    "review this inherited backtest repo for anything that would inflate the result"
   ],
   "should_not_trigger": [
     "fix the typescript build error in this react component",
